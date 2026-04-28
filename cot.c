@@ -1,0 +1,225 @@
+/*
+ * meshtastic-sniffer: CoT (Cursor-on-Target) XML multicast republish.
+ *
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+#include "cot.h"
+#include "node_db.h"
+#include "options.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "net_util.h"
+
+/* Endpoint state -- mutable at runtime via cot_set_endpoint(). */
+static int                g_fd = -1;
+static struct sockaddr_in g_dst;
+static bool               g_active = false;
+static pthread_mutex_t    g_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int cot_set_endpoint(const char *host, int port)
+{
+    pthread_mutex_lock(&g_lock);
+
+    /* Disable. */
+    if (!host || !*host || port <= 0) {
+        if (g_fd >= 0) { close(g_fd); g_fd = -1; }
+        g_active = false;
+        pthread_mutex_unlock(&g_lock);
+        if (verbose) fprintf(stderr, "cot: disabled\n");
+        return 0;
+    }
+
+    /* Open / reopen the socket. */
+    if (g_fd >= 0) { close(g_fd); g_fd = -1; }
+    g_active = false;
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    unsigned char ttl = 1;
+    setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+
+    struct sockaddr_in dst = {0};
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons((uint16_t)port);
+    if (resolve_host_ipv4(host, &dst.sin_addr) < 0) {
+        close(fd);
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+
+    g_fd     = fd;
+    g_dst    = dst;
+    g_active = true;
+    pthread_mutex_unlock(&g_lock);
+
+    fprintf(stderr, "cot: multicast %s:%d\n", host, port);
+    return 0;
+}
+
+void cot_init(void)
+{
+    if (!opt_cot_multicast) return;
+    char  host[64];
+    int   port = 6969;
+    const char *colon = strchr(opt_cot_multicast, ':');
+    size_t hlen = colon ? (size_t)(colon - opt_cot_multicast) : strlen(opt_cot_multicast);
+    if (hlen >= sizeof(host)) hlen = sizeof(host) - 1;
+    memcpy(host, opt_cot_multicast, hlen);
+    host[hlen] = 0;
+    if (colon) port = atoi(colon + 1);
+    if (port <= 0) port = 6969;
+    cot_set_endpoint(host, port);
+}
+
+void cot_shutdown(void)
+{
+    pthread_mutex_lock(&g_lock);
+    if (g_fd >= 0) { close(g_fd); g_fd = -1; }
+    g_active = false;
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void send_xml(const char *xml, size_t len)
+{
+    pthread_mutex_lock(&g_lock);
+    if (g_active && g_fd >= 0) {
+        sendto(g_fd, xml, len, MSG_DONTWAIT,
+               (struct sockaddr *)&g_dst, sizeof(g_dst));
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void iso8601_now(char *out, size_t out_size, int seconds_from_now)
+{
+    struct timeval tv; gettimeofday(&tv, NULL);
+    time_t t = tv.tv_sec + seconds_from_now;
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    snprintf(out, out_size, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(tv.tv_usec / 1000));
+}
+
+/* Map ATAK Role enum to a CoT type with subkind. Friendly + ground unit
+ * always; subkind specialises medic / sniper / HQ where known. */
+static const char *cot_type_for_atak(const mesh_atak_t *atak)
+{
+    switch (atak->role) {
+    case 4:  return "a-f-G-U-C-M";   /* Medic */
+    case 3:  return "a-f-G-U-C-I";   /* Sniper */
+    case 2:  return "a-f-G-U-C-H";   /* HQ */
+    default: return "a-f-G-U-C";
+    }
+}
+
+void cot_publish_atak(const mesh_event_t *ev, const mesh_atak_t *atak)
+{
+    if (!ev || !atak) return;
+    if (!g_active) return;
+
+    /* DETAIL = full uncompressed CoT XML, just forward. */
+    if (atak->kind == MESH_ATAK_DETAIL && atak->detail_xml && atak->detail_xml_len > 0) {
+        send_xml((const char *)atak->detail_xml, atak->detail_xml_len);
+        return;
+    }
+    if (atak->kind != MESH_ATAK_PLI) return;
+    if (!atak->have_lat || !atak->have_lon) return;
+
+    char now[40], stale[40];
+    iso8601_now(now,   sizeof(now),    0);
+    iso8601_now(stale, sizeof(stale), 60);
+
+    /* UID format: MESH[-<station>]-<callsign-or-!nodeid>. Multi-station
+     * deployments set --station-id so CoT UIDs don't collide across rxers. */
+    const char *station = (opt_station_id && *opt_station_id) ? opt_station_id : NULL;
+    char uid[96];
+    if (atak->callsign[0]) {
+        if (station) snprintf(uid, sizeof(uid), "MESH-%s-%s", station, atak->callsign);
+        else         snprintf(uid, sizeof(uid), "MESH-%s",    atak->callsign);
+    } else {
+        if (station) snprintf(uid, sizeof(uid), "MESH-%s-!%08x", station, ev->header.from);
+        else         snprintf(uid, sizeof(uid), "MESH-!%08x",    ev->header.from);
+    }
+
+    char xml[1024];
+    int n = snprintf(xml, sizeof(xml),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<event version=\"2.0\" uid=\"%s\" type=\"%s\" time=\"%s\" start=\"%s\" stale=\"%s\" how=\"m-g\">"
+        "<point lat=\"%.7f\" lon=\"%.7f\" hae=\"%d\" ce=\"15\" le=\"15\"/>"
+        "<detail>"
+        "<contact callsign=\"%s\"/>"
+        "<__group name=\"%s\" role=\"%s\"/>"
+        "<track speed=\"%u\" course=\"%u\"/>"
+        "<status battery=\"%u\"/>"
+        "<remarks>meshtastic-sniffer atak/from=!%08x</remarks>"
+        "</detail>"
+        "</event>",
+        uid, cot_type_for_atak(atak), now, now, stale,
+        atak->lat_deg, atak->lon_deg, atak->altitude_hae_m,
+        atak->callsign[0] ? atak->callsign : uid,
+        mesh_atak_team_name(atak->team), mesh_atak_role_name(atak->role),
+        atak->speed_mps, atak->course_deg, atak->battery,
+        ev->header.from);
+    if (n > 0) send_xml(xml, (size_t)n);
+}
+
+void cot_publish_position(const mesh_event_t *ev, const mesh_position_t *pos)
+{
+    if (!ev || !pos) return;
+    if (!g_active) return;
+    if (!pos->have_lat || !pos->have_lon) return;
+
+    /* Look up callsign from NODEINFO cache; fall back to !nodeid. */
+    node_record_t rec;
+    char callsign[NODE_DB_LONG_NAME];
+    if (node_db_lookup(ev->header.from, &rec) && rec.long_name[0]) {
+        strncpy(callsign, rec.long_name, sizeof(callsign) - 1);
+        callsign[sizeof(callsign) - 1] = 0;
+    } else {
+        snprintf(callsign, sizeof(callsign), "!%08x", ev->header.from);
+    }
+
+    char now[40], stale[40];
+    iso8601_now(now,   sizeof(now),    0);
+    iso8601_now(stale, sizeof(stale), 300);
+
+    const char *station = (opt_station_id && *opt_station_id) ? opt_station_id : NULL;
+    char uid[96];
+    if (station) snprintf(uid, sizeof(uid), "MESH-%s-!%08x", station, ev->header.from);
+    else         snprintf(uid, sizeof(uid), "MESH-!%08x", ev->header.from);
+
+    char xml[1024];
+    int n = snprintf(xml, sizeof(xml),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<event version=\"2.0\" uid=\"%s\" type=\"a-f-G-U-C\" time=\"%s\" start=\"%s\" stale=\"%s\" how=\"m-g\">"
+        "<point lat=\"%.7f\" lon=\"%.7f\" hae=\"%d\" ce=\"50\" le=\"50\"/>"
+        "<detail>"
+        "<contact callsign=\"%s\"/>"
+        "<__group name=\"meshtastic\" role=\"Team Member\"/>"
+        "<track speed=\"%u\" course=\"%u\"/>"
+        "<remarks>meshtastic-sniffer position/from=!%08x</remarks>"
+        "</detail>"
+        "</event>",
+        uid, now, now, stale,
+        pos->lat_deg, pos->lon_deg, pos->have_alt ? pos->altitude_m : 0,
+        callsign,
+        pos->ground_speed_mps, pos->ground_track,
+        ev->header.from);
+    if (n > 0) send_xml(xml, (size_t)n);
+}
