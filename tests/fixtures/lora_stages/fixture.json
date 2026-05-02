@@ -1,0 +1,17 @@
+{
+  "input": "00_input.bin",
+  "whitening": "01_whitening.bin",
+  "header": "02_header.bin",
+  "add_crc": "03_add_crc.bin",
+  "hamming": "04_hamming.bin",
+  "interleaver": "05_interleaver.bin",
+  "gray": "06_gray.bin",
+  "modulate": "07_modulate.cf32",
+  "params": {
+    "sf": 11,
+    "cr": 5,
+    "bw": 250000,
+    "samp_rate": 250000,
+    "text": "ABC"
+  }
+}
