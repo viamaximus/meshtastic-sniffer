@@ -204,7 +204,31 @@ void cot_publish_position(const mesh_event_t *ev, const mesh_position_t *pos)
     if (station) snprintf(uid, sizeof(uid), "MESH-%s-!%08x", station, ev->header.from);
     else         snprintf(uid, sizeof(uid), "MESH-!%08x", ev->header.from);
 
-    char xml[1024];
+    /* Build remarks string with all the operator-relevant context: which
+     * preset/SF/CR/BW the frame came in on, RSSI/SNR if available, hop info,
+     * and channel name when decryption matched. Lets a CoT consumer (ATAK)
+     * tell traffic on different physical pipes apart. */
+    char remarks[384];
+    int rn = 0;
+    rn += snprintf(remarks + rn, sizeof(remarks) - rn,
+                   "from=!%08x", ev->header.from);
+    if (ev->preset_name[0])
+        rn += snprintf(remarks + rn, sizeof(remarks) - rn,
+                       " preset=%s", ev->preset_name);
+    if (ev->sf > 0)
+        rn += snprintf(remarks + rn, sizeof(remarks) - rn,
+                       " SF%d/CR4-%d/BW%d", ev->sf, ev->cr, ev->bw_hz);
+    if (ev->channel_name[0])
+        rn += snprintf(remarks + rn, sizeof(remarks) - rn,
+                       " ch=%s", ev->channel_name);
+    if (ev->rssi_db != 0.0f || ev->snr_db != 0.0f)
+        rn += snprintf(remarks + rn, sizeof(remarks) - rn,
+                       " RSSI=%.1f SNR=%.1f", (double)ev->rssi_db, (double)ev->snr_db);
+    if (ev->hop_limit || ev->hop_start)
+        rn += snprintf(remarks + rn, sizeof(remarks) - rn,
+                       " hop=%d/%d", ev->hop_limit, ev->hop_start);
+
+    char xml[1280];
     int n = snprintf(xml, sizeof(xml),
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
         "<event version=\"2.0\" uid=\"%s\" type=\"a-f-G-U-C\" time=\"%s\" start=\"%s\" stale=\"%s\" how=\"m-g\">"
@@ -213,13 +237,13 @@ void cot_publish_position(const mesh_event_t *ev, const mesh_position_t *pos)
         "<contact callsign=\"%s\"/>"
         "<__group name=\"meshtastic\" role=\"Team Member\"/>"
         "<track speed=\"%u\" course=\"%u\"/>"
-        "<remarks>meshtastic-sniffer position/from=!%08x</remarks>"
+        "<remarks>%s</remarks>"
         "</detail>"
         "</event>",
         uid, now, now, stale,
         pos->lat_deg, pos->lon_deg, pos->have_alt ? pos->altitude_m : 0,
         callsign,
         pos->ground_speed_mps, pos->ground_track,
-        ev->header.from);
+        remarks);
     if (n > 0) send_xml(xml, (size_t)n);
 }
