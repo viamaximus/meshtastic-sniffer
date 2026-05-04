@@ -110,6 +110,13 @@ typedef struct {
     double   snr_db_sum;
     int      snr_db_count;
     uint64_t bytes;
+    /* Radio-layer parameters of this slot, captured at channel_create time
+     * so the stats-json line has self-describing preset/sf/cr/bw without
+     * the consumer re-deriving from frequency. */
+    int      sf;
+    int      cr;
+    int      bw_hz;
+    char     preset_name[24];
 } chan_stat_t;
 static chan_stat_t g_chan_stats[CHANNELIZER_MAX_CHANNELS];
 
@@ -311,9 +318,14 @@ static void *stats_thread(void *arg)
                         chan_stat_t *cs = &g_chan_stats[i];
                         double avg_snr = cs->snr_db_count
                             ? cs->snr_db_sum / (double)cs->snr_db_count : 0.0;
-                        fprintf(sf, "%s{\"id\":%d,\"frames\":%llu,\"decrypted\":%llu,"
+                        fprintf(sf, "%s{\"id\":%d", i ? "," : "", i);
+                        if (cs->preset_name[0])
+                            fprintf(sf, ",\"preset\":\"%s\"", cs->preset_name);
+                        if (cs->sf)
+                            fprintf(sf, ",\"sf\":%d,\"cr\":%d,\"bw_hz\":%d",
+                                    cs->sf, cs->cr, cs->bw_hz);
+                        fprintf(sf, ",\"frames\":%llu,\"decrypted\":%llu,"
                                     "\"avg_snr_db\":%.2f,\"bytes\":%llu}",
-                                i ? "," : "", i,
                                 (unsigned long long)cs->frames,
                                 (unsigned long long)cs->decrypted, avg_snr,
                                 (unsigned long long)cs->bytes);
@@ -387,6 +399,24 @@ static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr)
     if (!g_demods[id]) return -1;
     /* Stash channel id in user pointer so on_lora_frame can attribute stats. */
     lora_decoder_set_callback(g_demods[id], on_lora_frame, (void *)(intptr_t)id);
+
+    /* Capture this slot's radio params + preset name into per-channel stats
+     * so the stats-json line is self-describing. */
+    if (id >= 0 && id < CHANNELIZER_MAX_CHANNELS) {
+        g_chan_stats[id].sf    = sf;
+        g_chan_stats[id].cr    = cr;
+        g_chan_stats[id].bw_hz = bw_hz;
+        g_chan_stats[id].preset_name[0] = 0;
+        for (int p = 0; p < MESH_PRESET_COUNT; ++p) {
+            const mesh_preset_def_t *d = &MESH_PRESETS[p];
+            if (d->spread_factor == sf && d->coding_rate == cr &&
+                (d->bw_hz_narrow == bw_hz || d->bw_hz_wide == bw_hz)) {
+                strncpy(g_chan_stats[id].preset_name, d->channel_name,
+                        sizeof(g_chan_stats[id].preset_name) - 1);
+                break;
+            }
+        }
+    }
 
     /* Track in the known-grid list so the scanner excludes this freq. */
     if (g_grid_count < CHANNELIZER_MAX_CHANNELS) {

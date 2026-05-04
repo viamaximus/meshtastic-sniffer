@@ -9,11 +9,18 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 set -e
-BIN=${BIN:-./meshtastic-sniffer}
 PORT=${PORT:-8911}
 
-if [[ ! -x "$BIN" ]]; then
-    echo "FAIL: $BIN not found or not executable. Build first."
+# Find the binary: explicit $BIN env var, then ./meshtastic-sniffer (project
+# root after a make install-style copy), then build/meshtastic-sniffer (the
+# default cmake out-of-tree build path). Lets the test run from either the
+# project root or the build directory without symlink dances.
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ -n "$BIN" && -x "$BIN" ]]; then :;
+elif [[ -x "$HERE/meshtastic-sniffer" ]]; then BIN="$HERE/meshtastic-sniffer";
+elif [[ -x "$HERE/build/meshtastic-sniffer" ]]; then BIN="$HERE/build/meshtastic-sniffer";
+else
+    echo "FAIL: meshtastic-sniffer not found. Tried \$BIN, $HERE/, $HERE/build/."
     exit 1
 fi
 
