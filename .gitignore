@@ -22,3 +22,7 @@ compile_commands.json
 *.cf32
 *.sigmf-data
 *.sigmf-meta
+
+# Compiled test binaries / Python caches
+tests/test_lora_stages
+__pycache__/
