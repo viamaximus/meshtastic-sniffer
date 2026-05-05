@@ -49,8 +49,13 @@ int           opt_extra_freq_count    = 0;
 char       *opt_input_file = NULL;
 iq_format_t iq_format      = FMT_CI8;
 
-/* Per-backend gain controls */
-int   hackrf_lna_gain   = 24;
+/* Per-backend gain controls.
+ *
+ * HackRF default for Meshtastic: a node a few feet away saturates the
+ * front-end if LNA is up. Default to LNA=0 + modest VGA -- works for
+ * close traffic out of the box. Bump --gain to 40 (LNA=0 VGA=40),
+ * 60 (LNA=24 VGA=40), 70+ (LNA=40 VGA=62 +amp) for distant captures. */
+int   hackrf_lna_gain   = 0;
 int   hackrf_vga_gain   = 30;
 int   hackrf_amp_enable = 0;
 int   bladerf_gain_db   = 30;
@@ -116,7 +121,11 @@ void options_print_help(const char *prog)
         "RF:\n"
         "  --center=HZ            center frequency (default: region-derived)\n"
         "  --rate=HZ              sample rate (default: max for SDR)\n"
-        "  --gain=DB              RF gain (backend-specific)\n"
+        "  --gain=DB              RF gain (backend-specific). HackRF maps a single\n"
+        "                         knob across LNA+VGA+amp: 0..40 grows VGA only\n"
+        "                         (close-range default 30); 40..60 adds LNA in 8 dB\n"
+        "                         steps (distant rooftop ~50); 60..70 maxes both;\n"
+        "                         70+ enables the 14 dB front-end amp (very weak).\n"
         "  --bias-tee             enable antenna bias tee where supported\n"
         "  --ppm=PPM              SDR oscillator correction\n"
         "  --clock=internal|external|gpsdo\n"
