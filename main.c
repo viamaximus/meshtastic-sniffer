@@ -174,10 +174,68 @@ static void on_mesh_event(const mesh_event_t *ev, void *user) {
     feed_publish_event(ev);
 }
 
+/* Dedupe a frame by (packet_id, sf, bw). One real Meshtastic transmission
+ * leaks across several adjacent PFB output bins -- each bin's decoder
+ * locks on the same chirp and produces the same payload. Without this
+ * filter, a single frame shows up 20-40 times in the JSON stream and
+ * tears up the dashboard. We keep a small ring of recent (packet_id,
+ * sf, bw, ts_us) tuples and drop anything matching within 500 ms.
+ *
+ * The (sf, bw) part of the key keeps DIFFERENT presets that happen to
+ * share a packet_id (collision is rare but possible across mesh
+ * neighbours) from each shadowing the other. */
+#define DEDUP_RING_SIZE   64
+#define DEDUP_WINDOW_US   500000   /* 500 ms */
+typedef struct {
+    uint32_t packet_id;
+    int      sf;
+    int      bw_hz;
+    uint64_t ts_us;
+} dedup_entry_t;
+static dedup_entry_t g_dedup[DEDUP_RING_SIZE];
+static int           g_dedup_head;
+static pthread_mutex_t g_dedup_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static bool frame_is_duplicate(uint32_t packet_id, int sf, int bw_hz)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+    bool dup = false;
+    pthread_mutex_lock(&g_dedup_mu);
+    for (int i = 0; i < DEDUP_RING_SIZE; ++i) {
+        const dedup_entry_t *e = &g_dedup[i];
+        if (e->packet_id == packet_id && e->sf == sf && e->bw_hz == bw_hz &&
+            now_us - e->ts_us < DEDUP_WINDOW_US) {
+            dup = true;
+            break;
+        }
+    }
+    if (!dup) {
+        g_dedup[g_dedup_head] = (dedup_entry_t){
+            .packet_id = packet_id, .sf = sf, .bw_hz = bw_hz, .ts_us = now_us
+        };
+        g_dedup_head = (g_dedup_head + 1) % DEDUP_RING_SIZE;
+    }
+    pthread_mutex_unlock(&g_dedup_mu);
+    return dup;
+}
+
 static void on_lora_frame(const uint8_t *payload, size_t payload_len,
                           const lora_frame_meta_t *meta, void *user)
 {
     intptr_t channel_id = (intptr_t)user;
+    /* Drop PFB bin-leakage duplicates BEFORE counters and decode. The
+     * 16-byte Meshtastic radio header has packet_id at offset 8..11 LE. */
+    if (payload_len >= 12) {
+        uint32_t packet_id = (uint32_t)payload[8]
+                           | ((uint32_t)payload[9]  << 8)
+                           | ((uint32_t)payload[10] << 16)
+                           | ((uint32_t)payload[11] << 24);
+        int sf = meta ? meta->sf    : 0;
+        int bw = meta ? meta->bw_hz : 0;
+        if (frame_is_duplicate(packet_id, sf, bw)) return;
+    }
     __atomic_add_fetch(&g_frames_total, 1, __ATOMIC_RELAXED);
     if (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS) {
         __atomic_add_fetch(&g_chan_stats[channel_id].frames, 1, __ATOMIC_RELAXED);

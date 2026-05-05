@@ -250,7 +250,10 @@ void channelizer_process_int8(channelizer_t *c, const int8_t *iq, size_t n)
     int n_groups = c->n_groups;
     float complex *wb = c->workbuf;
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(dynamic, 1)
+    /* Cap threads to actual parallel work. With ~3 BWs (= 3 PFB groups
+     * for Meshtastic), we have 3 independent units; spawning 8+ threads
+     * to fight over 3 jobs thrashes the OMP runtime and CPU. */
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(n_groups > 0 ? n_groups : 1)
 #endif
     for (int g = 0; g < n_groups; ++g) {
         if (c->groups[g].active)
@@ -263,7 +266,10 @@ void channelizer_process_float(channelizer_t *c, const float complex *iq, size_t
     if (!c || n == 0) return;
     int n_groups = c->n_groups;
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(dynamic, 1)
+    /* Cap threads to actual parallel work. With ~3 BWs (= 3 PFB groups
+     * for Meshtastic), we have 3 independent units; spawning 8+ threads
+     * to fight over 3 jobs thrashes the OMP runtime and CPU. */
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(n_groups > 0 ? n_groups : 1)
 #endif
     for (int g = 0; g < n_groups; ++g) {
         if (c->groups[g].active)
