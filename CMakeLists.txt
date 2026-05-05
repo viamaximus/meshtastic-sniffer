@@ -150,6 +150,14 @@ if(FFTW3F_THREADS_LIB)
     target_link_libraries(meshtastic-sniffer PRIVATE ${FFTW3F_THREADS_LIB})
 endif()
 
+# OpenMP parallelizes the per-band loop in the channelizer batch path.
+# Optional: builds without it just degrade to single-thread.
+find_package(OpenMP)
+if(OpenMP_C_FOUND)
+    target_link_libraries(meshtastic-sniffer PRIVATE OpenMP::OpenMP_C)
+    message(STATUS "OpenMP enabled for parallel channelizer (-fopenmp)")
+endif()
+
 # Per-backend conditional compile / link
 foreach(_pair  SOAPYSDR:HAVE_SOAPYSDR:soapysdr.c
                SDRPLAY:HAVE_SDRPLAY:sdrplay.c

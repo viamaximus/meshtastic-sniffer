@@ -30,21 +30,44 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-#define STAGE_FIR_TAPS    63
+#define STAGE_FIR_TAPS    64    /* power-of-2 + AVX2-aligned for SIMD FIR */
 #define MAX_STAGES        4     /* per-stage cascade depth */
-#define MAX_BANDS         8     /* concurrent stage-1 band groups */
+#define MAX_BANDS         32    /* concurrent stage-1 band groups; sized for
+                                 * full US-band coverage at all preset BWs.
+                                 * Each band runs in its own OpenMP thread,
+                                 * so this caps stage-1 parallelism too. */
 #define INTERMEDIATE_RATE 2000000 /* target intermediate rate (Hz) */
 
+/* Decimating FIR stage. AVX2-friendly layout:
+ *  - hist[] is a 2x doubled circular buffer so the most recent NTAPS
+ *    samples are always contiguous starting at write_pos -- no wrap
+ *    test inside the inner loop.
+ *  - taps_b[] is the same coefficient broadcast as a (re, im) pair so
+ *    each AVX2 _mm256_load_ps lifts 4 complex × scalar multiplies.
+ *  Memory: 64*2*8 hist + 64*2*4 taps = 1.5 KB per stage. ~1 MB across
+ *  256 channels × 4 stages -- fits L2 comfortably. */
 typedef struct {
     int             decimation;
     int             count;
-    float           taps[STAGE_FIR_TAPS];
-    float complex   hist[STAGE_FIR_TAPS];
-    int             hist_idx;
+    int             write_pos;       /* in [0, STAGE_FIR_TAPS) */
+    int             pad_;
+    /* Note: NO __attribute__((aligned(32))) on the arrays. The struct gets
+     * heap-allocated via calloc (16-byte aligned at most), so the compiler
+     * would auto-vectorize with aligned stores under a false assumption and
+     * SIGSEGV. The FIR uses _mm256_loadu_ps anyway. */
+    float complex   hist[2 * STAGE_FIR_TAPS];
+    float           taps_b[2 * STAGE_FIR_TAPS];
 } decim_stage_t;
 
 typedef struct {
@@ -88,6 +111,10 @@ struct channelizer {
     chan_state_t   *channels[CHANNELIZER_MAX_CHANNELS];
     int             n_bands;
     band_state_t    bands[MAX_BANDS];
+    /* Workbuf for the cs8/cf32 input batch; lets per-band threads share
+     * a single int8-to-complex conversion instead of repeating it. */
+    float complex  *workbuf;
+    size_t          workbuf_cap;
 };
 
 /* ---- FIR design (Blackman-windowed sinc) ---- */
@@ -107,6 +134,20 @@ static void design_lowpass(float *taps, int ntaps, double cutoff_norm)
     }
     if (sum > 0.0)
         for (int i = 0; i < ntaps; ++i) taps[i] /= (float)sum;
+}
+
+/* Build the broadcast-tap layout for the FIR. The window is applied newest-
+ * first by walking hist[write_pos .. write_pos + NTAPS), so taps must be
+ * stored in REVERSE order (taps[NTAPS-1-k] for the k-th oldest sample). */
+static void install_taps(decim_stage_t *st, double cutoff)
+{
+    float taps[STAGE_FIR_TAPS];
+    design_lowpass(taps, STAGE_FIR_TAPS, cutoff);
+    for (int k = 0; k < STAGE_FIR_TAPS; ++k) {
+        float t = taps[STAGE_FIR_TAPS - 1 - k];
+        st->taps_b[2*k]     = t;
+        st->taps_b[2*k + 1] = t;
+    }
 }
 
 /* Plan a cascade of decimators that multiplies to `total`, each <=
@@ -149,22 +190,54 @@ static int largest_factor_leq(int n, int limit)
     return best;
 }
 
-/* Decimating-FIR step: returns 1 if a sample was emitted to *out. */
+/* Decimating FIR step. Writes the new sample into BOTH halves of the
+ * doubled history (so the contiguous NTAPS window starting at write_pos
+ * always represents the most recent samples), then if a decimated output
+ * is due, runs the broadcast-tap dot product. AVX2 path lifts 4 complex
+ * MACs per FMA; falls back to scalar otherwise. Returns 1 if *out was
+ * written, 0 if the sample was just buffered. */
 static inline int decim_stage_process(decim_stage_t *st,
                                       float complex in,
                                       float complex *out)
 {
-    st->hist[st->hist_idx] = in;
-    st->hist_idx = (st->hist_idx + 1) % STAGE_FIR_TAPS;
+    st->hist[st->write_pos] = in;
+    st->hist[st->write_pos + STAGE_FIR_TAPS] = in;
+    st->write_pos = (st->write_pos + 1) & (STAGE_FIR_TAPS - 1);
     if (++st->count < st->decimation) return 0;
     st->count = 0;
-    float complex acc = 0;
-    int idx = st->hist_idx;
-    for (int t = 0; t < STAGE_FIR_TAPS; ++t) {
-        idx = idx ? idx - 1 : STAGE_FIR_TAPS - 1;
-        acc += st->hist[idx] * st->taps[t];
+
+    const float *h = (const float *)&st->hist[st->write_pos];
+    const float *t = st->taps_b;
+
+#if defined(__AVX2__)
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    /* 16 iterations × 8 floats = 128 floats = 64 complex × 2 (taps duplicated).
+     * Use unaligned loads since calloc()'d struct hosts may not be 32-byte
+     * aligned even though the members are alignas(32). */
+    for (int k = 0; k < 2 * STAGE_FIR_TAPS; k += 16) {
+        __m256 hv0 = _mm256_loadu_ps(h + k);
+        __m256 tv0 = _mm256_loadu_ps(t + k);
+        acc0 = _mm256_fmadd_ps(hv0, tv0, acc0);
+        __m256 hv1 = _mm256_loadu_ps(h + k + 8);
+        __m256 tv1 = _mm256_loadu_ps(t + k + 8);
+        acc1 = _mm256_fmadd_ps(hv1, tv1, acc1);
     }
+    __m256 acc = _mm256_add_ps(acc0, acc1);
+    /* Horizontal-add: pack 4 (re, im) pairs into a single complex. */
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum128 = _mm_add_ps(lo, hi);              /* (a0,b0,a1,b1) */
+    __m128 shuf   = _mm_movehl_ps(sum128, sum128);   /* (a1,b1,a1,b1) */
+    __m128 final2 = _mm_add_ps(sum128, shuf);        /* (a0+a1, b0+b1, ...) */
+    *out = final2[0] + I * final2[1];
+#else
+    float complex acc = 0.0f + 0.0f * I;
+    const float complex *hc = (const float complex *)h;
+    for (int k = 0; k < STAGE_FIR_TAPS; ++k)
+        acc += hc[k] * t[2 * k];
     *out = acc;
+#endif
     return 1;
 }
 
@@ -185,10 +258,9 @@ static int init_band(band_state_t *b, double center_freq,
     for (int i = 0; i < b->num_stages; ++i) {
         b->stages[i].decimation = decims[i];
         b->stages[i].count = 0;
-        b->stages[i].hist_idx = 0;
+        b->stages[i].write_pos = 0;
         memset(b->stages[i].hist, 0, sizeof(b->stages[i].hist));
-        double cutoff = 0.4 / decims[i];
-        design_lowpass(b->stages[i].taps, STAGE_FIR_TAPS, cutoff);
+        install_taps(&b->stages[i], 0.4 / decims[i]);
         rate /= decims[i];
     }
     return 0;
@@ -318,11 +390,11 @@ int channelizer_add_channel(channelizer_t *c, const channel_cfg_t *cfg)
     for (int i = 0; i < s->num_stages; ++i) {
         s->stages[i].decimation = decims[i];
         s->stages[i].count = 0;
-        s->stages[i].hist_idx = 0;
+        s->stages[i].write_pos = 0;
         memset(s->stages[i].hist, 0, sizeof(s->stages[i].hist));
         double cutoff = half_bw / stage_in_rate;
         if (cutoff > 0.49) cutoff = 0.49;   /* safety: stay below Nyquist */
-        design_lowpass(s->stages[i].taps, STAGE_FIR_TAPS, cutoff);
+        install_taps(&s->stages[i], cutoff);
         stage_in_rate /= decims[i];
     }
 
@@ -357,16 +429,22 @@ static inline void emit_to_channel(chan_state_t *s, float complex x)
     }
 }
 
-/* Run one wideband sample through stage-1 (per-band) and feed each
- * decimated stage-1 output through stage-2 (per-channel) cascades. */
-static inline void process_one_sample(channelizer_t *c, float complex x)
+/* Process one full wideband-input batch through a single band's stage-1
+ * cascade and that band's stage-2 per-channel cascades. This is the
+ * OpenMP work unit: one thread per band, each thread sweeping the entire
+ * input batch for ITS band. Bands have fully independent state, so no
+ * synchronization is needed across threads.
+ *
+ * NOTE: chan_state's nco_current/renorm/stages/outbuf are read+written
+ * here. Each channel belongs to exactly one band, so parallelism over
+ * bands keeps channel state thread-local. */
+static void process_band_batch(channelizer_t *c, band_state_t *bd,
+                               const float complex *iq, size_t n)
 {
-    int n_bands = c->n_bands;
-    for (int b = 0; b < n_bands; ++b) {
-        band_state_t *bd = &c->bands[b];
-        if (!bd->active) continue;
+    if (!bd->active) return;
+    for (size_t i = 0; i < n; ++i) {
         /* Stage-1 NCO mix to band center. */
-        float complex y = x * bd->nco_current;
+        float complex y = iq[i] * bd->nco_current;
         bd->nco_current *= bd->nco_phasor;
         if (++bd->nco_renorm >= 1024) {
             bd->nco_renorm = 0;
@@ -375,14 +453,14 @@ static inline void process_one_sample(channelizer_t *c, float complex x)
         }
         /* Stage-1 cascade. */
         int produced = 1;
-        for (int i = 0; i < bd->num_stages && produced; ++i) {
+        for (int s1 = 0; s1 < bd->num_stages && produced; ++s1) {
             float complex out;
-            produced = decim_stage_process(&bd->stages[i], y, &out);
+            produced = decim_stage_process(&bd->stages[s1], y, &out);
             y = out;
         }
         if (!produced) continue;
-        /* For every stage-1 output sample, push through every channel
-         * in this band (stage-2). */
+        /* Stage-2: for every stage-1 output sample, push through every
+         * channel in this band. */
         for (int ci = 0; ci < bd->num_channels; ++ci) {
             int idx = bd->channel_indices[ci];
             chan_state_t *s = c->channels[idx];
@@ -395,9 +473,9 @@ static inline void process_one_sample(channelizer_t *c, float complex x)
                 if (mag > 0.0f) s->nco_current /= mag;
             }
             int p2 = 1;
-            for (int i = 0; i < s->num_stages && p2; ++i) {
+            for (int s2 = 0; s2 < s->num_stages && p2; ++s2) {
                 float complex out;
-                p2 = decim_stage_process(&s->stages[i], z, &out);
+                p2 = decim_stage_process(&s->stages[s2], z, &out);
                 z = out;
             }
             if (p2) emit_to_channel(s, z);
@@ -405,21 +483,45 @@ static inline void process_one_sample(channelizer_t *c, float complex x)
     }
 }
 
+/* Ensure the workbuf has at least `n` complex slots. Single producer, so
+ * realloc-up-only is safe between batches. */
+static int ensure_workbuf(channelizer_t *c, size_t n)
+{
+    if (c->workbuf_cap >= n) return 0;
+    float complex *nb = realloc(c->workbuf, n * sizeof(float complex));
+    if (!nb) return -1;
+    c->workbuf = nb;
+    c->workbuf_cap = n;
+    return 0;
+}
+
 void channelizer_process_int8(channelizer_t *c, const int8_t *iq, size_t n)
 {
-    if (!c) return;
+    if (!c || n == 0) return;
+    if (ensure_workbuf(c, n) < 0) return;
     const float scale = 1.0f / 127.0f;
     for (size_t i = 0; i < n; ++i) {
-        float complex x = (float)iq[2*i] * scale + I * (float)iq[2*i + 1] * scale;
-        process_one_sample(c, x);
+        c->workbuf[i] = (float)iq[2*i] * scale + I * (float)iq[2*i + 1] * scale;
+    }
+    int n_bands = c->n_bands;
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(dynamic, 1)
+#endif
+    for (int b = 0; b < n_bands; ++b) {
+        process_band_batch(c, &c->bands[b], c->workbuf, n);
     }
 }
 
 void channelizer_process_float(channelizer_t *c, const float complex *iq, size_t n)
 {
-    if (!c) return;
-    for (size_t i = 0; i < n; ++i)
-        process_one_sample(c, iq[i]);
+    if (!c || n == 0) return;
+    int n_bands = c->n_bands;
+#if defined(_OPENMP)
+    #pragma omp parallel for schedule(dynamic, 1)
+#endif
+    for (int b = 0; b < n_bands; ++b) {
+        process_band_batch(c, &c->bands[b], iq, n);
+    }
 }
 
 void channelizer_flush(channelizer_t *c)
@@ -441,5 +543,6 @@ void channelizer_destroy(channelizer_t *c)
     for (int i = 0; i < c->n_channels; ++i) {
         if (c->channels[i]) free(c->channels[i]);
     }
+    free(c->workbuf);
     free(c);
 }
