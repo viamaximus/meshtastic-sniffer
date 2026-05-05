@@ -46,7 +46,11 @@ typedef struct lora_frame_meta {
 typedef void (*lora_frame_cb_t)(const uint8_t *payload, size_t payload_len,
                                 const lora_frame_meta_t *meta, void *user);
 
+/* os_factor: input rate is os_factor * bw_hz. 1 = legacy (synthetic IQ,
+ * already at bw_hz). >=2 enables fractional-STO realignment which is
+ * necessary to lock real-radio captures with sub-sample timing offset. */
 lora_decoder_t *lora_decoder_create(int sf, int cr, int bw_hz);
+lora_decoder_t *lora_decoder_create_os(int sf, int cr, int bw_hz, int os_factor);
 
 /* Bind a frame callback. Called from inside lora_decoder_feed when a
  * complete frame has been decoded (or discarded after CRC failure if

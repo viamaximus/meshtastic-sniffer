@@ -271,10 +271,22 @@ int channelizer_add_channel(channelizer_t *c, const channel_cfg_t *cfg)
     if (!s) return -1;
     s->id  = slot;
     s->cfg = *cfg;
+    if (s->cfg.os_factor <= 0) s->cfg.os_factor = 1;
 
-    /* Total decim = samp_rate / bw_hz. Split into stage-1 (max
-     * INTERMEDIATE_RATE intermediate) and stage-2 (the rest). */
-    int total_decim = (int)(c->samp_rate / (uint32_t)cfg->bw_hz);
+    /* Total decim = samp_rate / (os_factor * bw_hz). os_factor=1 emits at
+     * exactly bw_hz (legacy LoRa demod input). os_factor>=2 leaves room
+     * for the LoRa demod's fractional-STO interpolation -- needed to
+     * lock real-radio captures with sub-sample timing offsets. */
+    uint32_t out_rate = (uint32_t)s->cfg.os_factor * (uint32_t)cfg->bw_hz;
+    if (out_rate > c->samp_rate) { free(s); return -1; }
+    if (c->samp_rate % out_rate != 0) {
+        if (verbose)
+            fprintf(stderr, "channelizer: non-integer total decim: rate=%u out_rate=%u\n",
+                    c->samp_rate, out_rate);
+        free(s);
+        return -1;
+    }
+    int total_decim = (int)(c->samp_rate / out_rate);
     int max_s1 = (int)(c->samp_rate / INTERMEDIATE_RATE);
     if (max_s1 < 1) max_s1 = 1;
     int s1_decim = largest_factor_leq(total_decim, max_s1);

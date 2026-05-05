@@ -384,18 +384,30 @@ static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr)
         return -1;
     }
 
+    /* Pick os_factor automatically: prefer 4× oversampling when the
+     * SDR rate has the headroom (samp_rate / bw_hz >= 4 and divides
+     * cleanly). os_factor>=2 lets the LoRa demod recover from
+     * fractional-sample timing offsets common on real radio. */
+    int os_factor = 1;
+    uint32_t sr_int = (uint32_t)samp_rate;
+    if ((uint32_t)bw_hz > 0 && sr_int % (uint32_t)bw_hz == 0) {
+        uint32_t total = sr_int / (uint32_t)bw_hz;
+        if (total >= 4 && total % 4 == 0)      os_factor = 4;
+        else if (total >= 2 && total % 2 == 0) os_factor = 2;
+    }
     channel_cfg_t cfg = {
         .f_hz        = f_hz,
         .bw_hz       = bw_hz,
         .sf          = sf,
         .cr          = cr,
+        .os_factor   = os_factor,
         .on_baseband = on_channel_baseband,
         .user        = NULL,
     };
     int id = channelizer_add_channel(g_channelizer, &cfg);
     if (id < 0) return -1;
 
-    g_demods[id] = lora_decoder_create(sf, cr, bw_hz);
+    g_demods[id] = lora_decoder_create_os(sf, cr, bw_hz, os_factor);
     if (!g_demods[id]) return -1;
     /* Stash channel id in user pointer so on_lora_frame can attribute stats. */
     lora_decoder_set_callback(g_demods[id], on_lora_frame, (void *)(intptr_t)id);

@@ -33,6 +33,9 @@ typedef struct channel_cfg {
     int               bw_hz;      /* LoRa BW: 62500/125000/250000/500000 (or 2.4 GHz wide variants) */
     int               sf;         /* spreading factor 7..12 */
     int               cr;         /* coding rate denominator 5..8 (4/5..4/8) */
+    int               os_factor;  /* output rate = os_factor * bw_hz; 1 = legacy
+                                   * (no oversampling). >=2 enables fractional-
+                                   * STO recovery in the LoRa demod. */
     channelizer_cb_t  on_baseband;
     void             *user;
 } channel_cfg_t;

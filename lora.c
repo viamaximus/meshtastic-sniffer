@@ -217,7 +217,10 @@ struct lora_decoder {
     int  sf;
     int  cr;          /* coding rate denominator (5..8) */
     int  bw_hz;
-    int  N;           /* 2^SF -- FFT size and samples per symbol */
+    int  N;           /* 2^SF -- FFT size; samples per chirp slope unit at bw_hz */
+    int  os_factor;   /* input rate / bw_hz; 1 = legacy. >=2 enables fractional STO. */
+    int  samples_per_symbol; /* N * os_factor */
+    int  sto_offset;  /* integer sub-sample offset 0..os_factor-1 chosen during preamble lock */
 
     /* Precomputed reference chirps. */
     fftwf_complex *downchirp;   /* conjugate of upchirp -- for symbol decode */
@@ -315,17 +318,25 @@ static void build_chirps(fftwf_complex *up, fftwf_complex *down, int N)
 
 lora_decoder_t *lora_decoder_create(int sf, int cr, int bw_hz)
 {
+    return lora_decoder_create_os(sf, cr, bw_hz, 1);
+}
+
+lora_decoder_t *lora_decoder_create_os(int sf, int cr, int bw_hz, int os_factor)
+{
     if (sf < 7 || sf > 12 || cr < 5 || cr > 8 || bw_hz <= 0) return NULL;
+    if (os_factor < 1 || os_factor > 16) return NULL;
     lora_decoder_t *d = calloc(1, sizeof(*d));
     if (!d) return NULL;
     d->sf = sf; d->cr = cr; d->bw_hz = bw_hz;
     d->N  = 1 << sf;
+    d->os_factor = os_factor;
+    d->samples_per_symbol = d->N * os_factor;
 
     d->downchirp = fftwf_alloc_complex(d->N);
     d->upchirp   = fftwf_alloc_complex(d->N);
     d->fft_in    = fftwf_alloc_complex(d->N);
     d->fft_out   = fftwf_alloc_complex(d->N);
-    d->symbuf    = malloc(sizeof(float complex) * (size_t)d->N);
+    d->symbuf    = malloc(sizeof(float complex) * (size_t)d->samples_per_symbol);
     if (!d->downchirp || !d->upchirp || !d->fft_in || !d->fft_out || !d->symbuf) {
         lora_decoder_destroy(d);
         return NULL;
@@ -373,7 +384,35 @@ void lora_decoder_destroy(lora_decoder_t *d)
     free(d);
 }
 
-/* ---- DSP helpers ---- */
+/* ---- DSP helpers ----
+ *
+ * When os_factor > 1, the symbol buffer holds N*os samples per symbol.
+ * We need to pick N samples with a sub-sample offset (the "phase") for
+ * dechirp+FFT. The phase is chosen during preamble lock to align the
+ * sampling grid with the chirp boundaries -- without this, real-radio
+ * captures land each chirp at a fractional offset that smears the FFT
+ * peak and breaks decode.
+ *
+ * Picks samples at indices os/2 + os*k - phase, k=0..N-1. Phase comes
+ * from d->sto_offset, set during preamble lock. For os_factor=1 this
+ * collapses to a memcpy (phase always 0). */
+static inline const float complex *
+downsample_symbol(lora_decoder_t *d, const float complex *src, int phase,
+                  float complex *scratch)
+{
+    if (d->os_factor == 1) return src;
+    int os = d->os_factor;
+    int half = os / 2;
+    if (phase < 0) phase = 0;
+    if (phase >= os) phase = os - 1;
+    for (int k = 0; k < d->N; ++k) {
+        int idx = half + os * k - phase;
+        if (idx < 0) idx = 0;
+        if (idx >= d->samples_per_symbol) idx = d->samples_per_symbol - 1;
+        scratch[k] = src[idx];
+    }
+    return scratch;
+}
 
 /* Dechirp + FFT one symbol's worth (N) of samples.  Returns the
  * argmax bin (the symbol value). Also fills *peak_mag and *noise_mag
@@ -620,13 +659,33 @@ static void reset_to_idle(lora_decoder_t *d)
 /* Run the state machine for one accumulated symbol. */
 static void state_tick(lora_decoder_t *d)
 {
+    /* Scratch for the downsampled symbol when os_factor>1. */
+    static float complex scratch[MAX_FFT];
+    /* During IDLE/PREAMBLE_OK, search across all sub-sample phases and
+     * pick the one with the strongest peak. This is the integer-step
+     * fractional-STO recovery that gr-lora_sdr does internally. Once
+     * a preamble is locked we stick with the chosen sto_offset for the
+     * rest of the frame. */
+    if (d->os_factor > 1 && (d->state == STATE_IDLE || d->state == STATE_PREAMBLE_OK)) {
+        float best_peak = -1.0f;
+        int   best_phase = 0;
+        for (int ph = 0; ph < d->os_factor; ++ph) {
+            const float complex *cand = downsample_symbol(d, d->symbuf, ph, scratch);
+            float pk = 0.0f, ns = 1.0f;
+            (void)demod_one_symbol(d, cand, &pk, &ns);
+            if (pk > best_peak) { best_peak = pk; best_phase = ph; }
+        }
+        d->sto_offset = best_phase;
+    }
+    const float complex *sym_samples = downsample_symbol(d, d->symbuf,
+                                                         d->sto_offset, scratch);
     float peak = 0.0f, noise = 1.0f;
     /* During preamble lock, also capture the complex FFT bin value at the
      * tracked preamble_bin so we can derive cfo_frac from successive
      * samples' phase delta. Outside PREAMBLE_OK we don't care. */
     float complex preamble_bin_val = 0.0f + 0.0f * I;
     bool capture_preamble = (d->state == STATE_PREAMBLE_OK);
-    uint16_t sym = demod_one_symbol_full(d, d->symbuf, &peak, &noise,
+    uint16_t sym = demod_one_symbol_full(d, sym_samples, &peak, &noise,
         capture_preamble ? d->preamble_bin : -1,
         capture_preamble ? &preamble_bin_val : NULL);
 
@@ -751,7 +810,7 @@ static void state_tick(lora_decoder_t *d)
                 d->sync2_bin = (int)sym;
             }
             if (d->header_idx == 1) {
-                int down_val = demod_downchirp_argmax(d, d->symbuf);
+                int down_val = demod_downchirp_argmax(d, sym_samples);
                 if ((uint32_t)down_val < (uint32_t)(d->N / 2))
                     d->cfo_int = down_val / 2;
                 else
@@ -773,15 +832,18 @@ static void state_tick(lora_decoder_t *d)
                  * before any cfo subtraction. (Sounds odd but the math
                  * works out because preamble_bin = -k_sample + cfo_int.)
                  * Allow ±1 bin slop for residual fractional cfo. */
+                /* Soft-warn only on non-canonical sync2: at non-zero CFO
+                 * the observed bin shifts away from 16/88 by an amount
+                 * that depends on residual STO. The header checksum a
+                 * few ticks later is the real validator. Per the
+                 * crankylinuxuser reference flowgraph: hard sync-word
+                 * verification at this stage rejects too many real-radio
+                 * frames, so the working approach is to log and continue. */
                 int d12 = abs(d->sync2_bin - 16);  if (d12 > d->N / 2) d12 = d->N - d12;
                 int d2b = abs(d->sync2_bin - 88);  if (d2b > d->N / 2) d2b = d->N - d2b;
-                if (d12 > 1 && d2b > 1) {
-                    if (trace_on || verbose >= 2)
-                        fprintf(stderr, "[lora] sync-word mismatch: sync2 bin %d, "
-                                "expected 16 (0x12) or 88 (0x2B) -- dropping frame\n",
-                                d->sync2_bin);
-                    reset_to_idle(d);
-                    break;
+                if (d12 > 1 && d2b > 1 && (trace_on || verbose >= 3)) {
+                    fprintf(stderr, "[lora] sync2 bin %d off canonical (cfo_int=%d)\n",
+                            d->sync2_bin, d->cfo_int);
                 }
             }
             d->header_idx++;
@@ -815,7 +877,7 @@ static void state_tick(lora_decoder_t *d)
             if (d->soft_decoding) {
                 /* In soft mode we keep per-bit LLRs; the gray demap and
                  * (raw-1) shift are folded into compute_symbol_llrs. */
-                compute_symbol_llrs(d, d->symbuf, sf_app_h, true,
+                compute_symbol_llrs(d, sym_samples, sf_app_h, true,
                                     d->header_llrs[hi]);
             } else {
                 /* gr-lora_sdr fft_demod_impl.cc:313 + gray_mapping_impl.cc:70:
@@ -950,7 +1012,7 @@ static void state_tick(lora_decoder_t *d)
         int sf_p_active = d->payload_ldro ? (d->sf - 2) : d->sf;
         if (d->soft_decoding) {
             if (d->payload_sym_count < MAX_PAYLOAD_SYMBOLS)
-                compute_symbol_llrs(d, d->symbuf, sf_p_active, d->payload_ldro,
+                compute_symbol_llrs(d, sym_samples, sf_p_active, d->payload_ldro,
                                     d->payload_llrs[d->payload_sym_count++]);
         } else {
             int corr = ((int)sym - d->preamble_bin - 1) % d->N;
@@ -1029,15 +1091,19 @@ static void state_tick(lora_decoder_t *d)
 void lora_decoder_feed(lora_decoder_t *d, const float complex *samples, size_t n)
 {
     if (!d || !samples) return;
+    /* All sample counts (skip + symbuf) are in INPUT samples (rate =
+     * os_factor * bw_hz). When os_factor=1 this is a no-op vs the old
+     * code; when os_factor>=2 the symbol buffer holds os_factor times
+     * more raw samples and state_tick downsamples internally with the
+     * fractional-STO offset before dechirp+FFT. */
+    int spsym = d->samples_per_symbol;
     for (size_t i = 0; i < n; ++i) {
-        /* STO realignment: after preamble lock we skip (N - k_hat) samples
-         * to land the next FFT window on the modulator's symbol boundary. */
         if (d->sto_skip_remaining > 0) {
             --d->sto_skip_remaining;
             continue;
         }
         d->symbuf[d->symbuf_count++] = samples[i];
-        if (d->symbuf_count == d->N) {
+        if (d->symbuf_count == spsym) {
             state_tick(d);
             d->symbuf_count = 0;
         }
