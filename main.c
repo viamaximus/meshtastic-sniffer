@@ -203,10 +203,17 @@ static void on_mesh_event(const mesh_event_t *ev, void *user) {
  * fingerprint within DEDUP_WINDOW_US has popcount(xor) <= threshold
  * AND same (sf, bw). Threshold is well below random-distance so
  * false matches are essentially impossible. */
-#define DEDUP_RING_SIZE        128
-#define DEDUP_WINDOW_US        50000     /* 50 ms (= ~25 chirp durations max) */
-#define DEDUP_FP_HAMMING_THRESH 14       /* random 64-bit Hamming dist ~32 */
-#define DEDUP_DECRYPT_ATTEMPTS 3
+#define DEDUP_RING_SIZE             128
+#define DEDUP_WINDOW_US             50000   /* 50 ms */
+#define DEDUP_FP_HAMMING_THRESH     14      /* random 64-bit dist ~32 */
+/* Two retry budgets. When a leakage cluster's channel-hash matches a
+ * key we have loaded, ride the cluster long enough to find a copy
+ * with few enough bit errors that AES decrypts cleanly (up to ~30
+ * leakage replicas per chirp). When no key matches that hash, no
+ * point retrying -- emit one undecrypted line and suppress the rest
+ * to keep the JSON stream readable. */
+#define DEDUP_ATTEMPTS_KEYED        32
+#define DEDUP_ATTEMPTS_UNKEYED      1
 
 /* 64-bit XOR-fold fingerprint of the payload bytes. Two near-identical
  * byte arrays produce near-identical fingerprints; a single bit error
@@ -242,13 +249,26 @@ static int           g_dedup_head;
 static pthread_mutex_t g_dedup_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* The new key is a fingerprint, not a packet_id (packet_id mutates
- * with bit errors). Keep the function name + signature compatible
- * with on_lora_frame's call-site by computing the fingerprint inside. */
+ * with bit errors). Keep the function signature compatible with
+ * on_lora_frame's call-site by computing the fingerprint inside.
+ * The channel_hash arg drives the keyed/unkeyed retry budget. */
 static bool frame_is_duplicate(const uint8_t *payload, size_t payload_len,
-                               int sf, int bw_hz)
+                               int sf, int bw_hz, uint8_t channel_hash)
 {
     if (!payload || payload_len < 12) return false;
     uint64_t fp = payload_fingerprint(payload, payload_len);
+
+    /* Probe the keyset to set the retry budget. If we have any key
+     * with this channel_hash, ride leakage cluster long enough to
+     * find a clean-bit-error copy. Otherwise: cap at 1 line per
+     * cluster -- the user can't decrypt these anyway. */
+    int budget = DEDUP_ATTEMPTS_UNKEYED;
+    if (g_keys) {
+        keyset_rdlock(g_keys);
+        const int8_t *idxs = keyset_lookup(g_keys, channel_hash);
+        if (idxs && idxs[0] != -1) budget = DEDUP_ATTEMPTS_KEYED;
+        keyset_rdunlock(g_keys);
+    }
 
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -265,7 +285,7 @@ static bool frame_is_duplicate(const uint8_t *payload, size_t payload_len,
         if (hd <= DEDUP_FP_HAMMING_THRESH) { match = e; break; }
     }
     if (match) {
-        if (match->ever_decrypted || match->attempts >= DEDUP_DECRYPT_ATTEMPTS) {
+        if (match->ever_decrypted || match->attempts >= budget) {
             suppress = true;
         } else {
             match->attempts++;
@@ -318,7 +338,11 @@ static void on_lora_frame(const uint8_t *payload, size_t payload_len,
     {
         int sf = meta ? meta->sf    : 0;
         int bw = meta ? meta->bw_hz : 0;
-        if (frame_is_duplicate(payload, payload_len, sf, bw)) return;
+        /* channel_hash is at offset 13 in the radio header (preceded
+         * by to[4], from[4], packet_id[4], flags[1]). */
+        uint8_t channel_hash = payload_len > 13 ? payload[13] : 0;
+        if (frame_is_duplicate(payload, payload_len, sf, bw, channel_hash))
+            return;
     }
     __atomic_add_fetch(&g_frames_total, 1, __ATOMIC_RELAXED);
     if (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS) {
