@@ -279,6 +279,10 @@ void *vita49_thread(void *arg)
             bind_addr, port,
             iq_format == FMT_CF32 ? "cf32" :
             iq_format == FMT_CI16 ? "cs16" : "cs8");
+    fprintf(stderr, "vita49: sender must emit VRT signal-data packets in big-endian\n"
+                    "        byte order; VRL ('VRLP') wrapper optional; matching IQ\n"
+                    "        format (--iq-format). IF-context packets are honored for\n"
+                    "        sample_rate + RF freq when not pinned on the CLI.\n");
     free(ep);
 
     uint8_t pkt_buf[VRT_MAX_PKT];
