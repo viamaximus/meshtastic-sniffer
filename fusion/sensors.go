@@ -141,7 +141,9 @@ func (r *Registry) saveLocked() error {
 	if err := os.MkdirAll(filepath.Dir(r.path), 0755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(tmp, b, 0644); err != nil {
+	// 0600 -- the file persists ApiToken and CurvePub per sensor; treat
+	// it like a credential store, not a public config.
+	if err := os.WriteFile(tmp, b, 0600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, r.path)

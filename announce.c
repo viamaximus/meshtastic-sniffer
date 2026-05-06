@@ -98,16 +98,24 @@ static int build_body(char *out, size_t cap)
     double lat=0, lon=0, alt=0, age=0;
     bool have_fix = gpsd_get_fix(&lat, &lon, &alt, &age) && age < 60.0;
 
-    int n = snprintf(out, cap,
-        "{\"name\":\"%s\"", name);
-    if (zmq_buf[0]) n += snprintf(out + n, cap - n, ",\"zmq\":\"%s\"", zmq_buf);
-    if (api_buf[0]) n += snprintf(out + n, cap - n, ",\"api\":\"%s\"", api_buf);
-    if (have_fix) {
-        n += snprintf(out + n, cap - n,
-            ",\"lat\":%.7f,\"lon\":%.7f,\"alt_m\":%.1f", lat, lon, alt);
-    }
-    n += snprintf(out + n, cap - n, "}");
+    /* Chained snprintf: each step must verify it neither failed nor
+     * filled the buffer, otherwise (cap - n) underflows on the next
+     * call and writes past `out`. Caller treats a 0 return as failure. */
+#define APPEND(fmt, ...) do { \
+        if (n < 0 || (size_t)n >= cap) return 0; \
+        int _w = snprintf(out + n, cap - (size_t)n, (fmt), ##__VA_ARGS__); \
+        if (_w < 0) return 0; \
+        n += _w; \
+    } while (0)
+
+    int n = snprintf(out, cap, "{\"name\":\"%s\"", name);
+    if (n < 0 || (size_t)n >= cap) return 0;
+    if (zmq_buf[0]) APPEND(",\"zmq\":\"%s\"", zmq_buf);
+    if (api_buf[0]) APPEND(",\"api\":\"%s\"", api_buf);
+    if (have_fix) APPEND(",\"lat\":%.7f,\"lon\":%.7f,\"alt_m\":%.1f", lat, lon, alt);
+    APPEND("}");
     return n;
+#undef APPEND
 }
 
 static void post_once(void)

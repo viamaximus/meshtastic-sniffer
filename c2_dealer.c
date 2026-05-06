@@ -104,6 +104,11 @@ static void send_heartbeat(void)
 
 static void handle_command(const char *frame, size_t frame_len)
 {
+    /* Cap inbound frame at 64 KiB. Any legitimate C2 envelope is well
+     * under this; the cap also prevents a malicious peer from forcing
+     * a giant alloc, and keeps the malloc(frame_len + 1) below from
+     * underflowing if frame_len ever reached SIZE_MAX. */
+    if (frame_len == 0 || frame_len > 65536) return;
     /* Copy frame into a NUL-terminated buffer for json_extract. */
     char *zframe = malloc(frame_len + 1);
     if (!zframe) return;

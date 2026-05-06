@@ -16,7 +16,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"sync"
@@ -121,13 +120,12 @@ func installFanoutHandlers(mux *http.ServeMux, registry *Registry) {
 		ep := ep // capture
 		mux.HandleFunc("/api/fanout/"+ep, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
-				http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+				jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"error":"read body: %s"}`, err),
-					http.StatusBadRequest)
+				jsonError(w, "read body: "+err.Error(), http.StatusBadRequest)
 				return
 			}
 			results := fanoutCommand(registry, ep, body)

@@ -104,6 +104,22 @@ func (h *SSEHub) register() (chan []byte, [][]byte, func()) {
 
 // indexHTML is defined in dashboard.go as dashboardHTML.
 
+// jsonError writes a JSON-encoded error response. Always uses
+// encoding/json so dynamic strings (err.Error(), sensor names) can't
+// produce malformed JSON when they contain quotes or backslashes.
+func jsonError(w http.ResponseWriter, msg string, status int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// jsonOK writes a 200 JSON object body. Same allocation discipline as
+// jsonError -- uses encoding/json so values are escaped correctly.
+func jsonOK(w http.ResponseWriter, body map[string]string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(body)
+}
+
 // startWebServer runs an HTTP server on `listen` that serves the placeholder
 // index, /events SSE endpoint, and /api/sensors registry endpoints.
 // Returns when ctx is cancelled.
@@ -125,17 +141,16 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 		case http.MethodPost:
 			var s Sensor
 			if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
-				http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+				jsonError(w, "invalid JSON", http.StatusBadRequest)
 				return
 			}
 			if err := registry.Add(&s); err != nil {
-				http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+				jsonError(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprintf(w, `{"added":"%s"}`, s.Name)
+			jsonOK(w, map[string]string{"added": s.Name})
 		default:
-			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
 	// Command fan-out endpoints: /api/fanout/keys, share-url, etc.
@@ -143,20 +158,19 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 	mux.HandleFunc("/api/sensors/", func(w http.ResponseWriter, r *http.Request) {
 		// Path: /api/sensors/<name> (DELETE only).
 		if r.Method != http.MethodDelete {
-			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		name := r.URL.Path[len("/api/sensors/"):]
 		if name == "" {
-			http.Error(w, `{"error":"missing name"}`, http.StatusBadRequest)
+			jsonError(w, "missing name", http.StatusBadRequest)
 			return
 		}
 		if err := registry.Remove(name); err != nil {
-			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
+			jsonError(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"removed":"%s"}`, name)
+		jsonOK(w, map[string]string{"removed": name})
 	})
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
@@ -167,7 +181,10 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// Same-origin only -- the dashboard HTML is served from the same
+		// listener, so it doesn't need CORS. Dropping the wildcard means
+		// a malicious page in the operator's browser can't EventSource
+		// our live feed cross-origin.
 		flusher.Flush()
 
 		ch, replay, unregister := hub.register()
