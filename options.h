@@ -121,7 +121,6 @@ extern char *opt_mqtt_topic;
 extern char *opt_zmq_endpoint;
 extern char *opt_cot_multicast;          /* "239.2.3.1:6969" or NULL */
 extern int   opt_web_port;
-extern bool  opt_web_spectrum;
 extern char *opt_station_id;
 
 int  options_parse(int argc, char **argv);

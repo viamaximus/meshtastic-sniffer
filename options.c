@@ -92,7 +92,6 @@ char *opt_mqtt_topic              = NULL;
 char *opt_zmq_endpoint            = NULL;
 char *opt_cot_multicast           = NULL;
 int   opt_web_port                = 0;
-bool  opt_web_spectrum            = false;
 char *opt_station_id              = NULL;
 
 void options_print_help(const char *prog)
@@ -114,9 +113,18 @@ void options_print_help(const char *prog)
         "  --sdrplay[=SERIAL]     use SDRplay native API\n"
         "  --airspy[=SERIAL]      use Airspy R2/Mini\n"
         "  --usrp=ARGS            use USRP via UHD\n"
-        "  --vita49=PORT          listen for VITA-49 UDP\n"
+        "  --vita49=[BIND:]PORT   listen for VITA-49 (VRT) UDP. PORT is required;\n"
+        "                         BIND defaults to 0.0.0.0. Sender side must use:\n"
+        "                           - VRT signal-data packets (network byte order, big-endian)\n"
+        "                           - matching --iq-format (ci8 default, ci16, or cf32)\n"
+        "                         VRL wrapper ('VRLP') is auto-detected (optional).\n"
+        "                         IF-context packets are auto-adopted: sample_rate (Q44.20)\n"
+        "                         and RF freq override missing CLI values, so a sender\n"
+        "                         that emits context can run with bare --vita49=PORT.\n"
         "  --file=PATH            replay IQ file\n"
-        "  --iq-format=FMT        cs8 (default) | cs16 | cf32\n"
+        "  --iq-format=FMT        cs8 (default) | cs16 | cf32. Used for raw file replay\n"
+        "                         AND for the VITA-49 payload format -- the sender's\n"
+        "                         sample type must match.\n"
         "\n"
         "RF:\n"
         "  --center=HZ            center frequency (default: region-derived)\n"
@@ -159,7 +167,6 @@ void options_print_help(const char *prog)
         "                         republish ATAK port-72 PLIs as CoT XML to a\n"
         "                         multicast group (default port 6969). LAN-scope.\n"
         "  --web[=PORT]           built-in dashboard (default 8888)\n"
-        "  --web-spectrum         enable spectrum tab\n"
         "  --station-id=ID        station identifier in feed messages\n"
         "\n"
         "Misc:\n"
@@ -219,7 +226,7 @@ int options_parse(int argc, char **argv)
         O_CENTER, O_RATE, O_GAIN, O_BIAS, O_PPM, O_CLOCK,
         O_REGION, O_PRESETS, O_KEYS, O_KEYS_FILE, O_SHARE_URL, O_EXTRA_FREQ,
         O_IQ_RECORD, O_STATS_JSON,
-        O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_WEB_SPECTRUM, O_STATION,
+        O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_STATION,
         O_DECODE, O_SCAN, O_SCAN_DEC, O_ALERT_OFF_GRID,
         O_SIMD_GEN, O_SELFTEST, O_LIST,
     };
@@ -254,7 +261,6 @@ int options_parse(int argc, char **argv)
         { "zmq",        optional_argument, NULL, O_ZMQ },
         { "cot-multicast", required_argument, NULL, O_COT },
         { "web",        optional_argument, NULL, O_WEB },
-        { "web-spectrum", no_argument,     NULL, O_WEB_SPECTRUM },
         { "station-id", required_argument, NULL, O_STATION },
         { "decode",     no_argument,       NULL, O_DECODE },
         { "scan",       no_argument,       NULL, O_SCAN },
@@ -359,7 +365,6 @@ int options_parse(int argc, char **argv)
         case O_ZMQ:        opt_zmq_endpoint = optarg ? strdup(optarg) : strdup("tcp://*:7008"); break;
         case O_COT:        opt_cot_multicast = strdup(optarg); break;
         case O_WEB:        opt_web_port = optarg ? atoi(optarg) : 8888; break;
-        case O_WEB_SPECTRUM: opt_web_spectrum = true; break;
         case O_STATION:    opt_station_id = strdup(optarg); break;
 
         case O_DECODE:           opt_op_mode = OP_MODE_DECODE; break;
