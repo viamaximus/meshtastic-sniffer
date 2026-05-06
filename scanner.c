@@ -216,11 +216,38 @@ static void run_peakfind(scanner_t *s)
         ++d->hits;
 
         if (d->hits == 3 && s->cb) {
-            /* announce after 3 confirmations to avoid spurious one-frame spikes */
+            /* announce after 3 confirmations to avoid spurious one-frame spikes.
+             *
+             * Estimate actual occupied bandwidth: walk outward from the peak
+             * until the bin power drops below peak/10 (-10 dB skirt). The
+             * single-bin Hz width was a misleading number -- a strong CW carrier
+             * looked the same as a 250 kHz LoRa chirp because both light up one
+             * bin per FFT frame. With a real BW estimate we can require the
+             * detection to look at least LoRa-shaped (>= 50 kHz wide) and skip
+             * narrowband stuff (CW beacons, FM pilot tones, IM products). */
+            const float bin_hz   = (float)((double)s->samp_rate / (double)s->fft_size);
+            const float peak_pow = s->power_avg[k];
+            const float skirt    = peak_pow * 0.1f; /* -10 dB */
+            int left = 0, right = 0;
+            for (int j = 1; j <= s->fft_size / 4; ++j) {
+                int kk = k - j; if (kk < 0) kk += s->fft_size;
+                if (s->power_avg[kk] < skirt) break;
+                left = j;
+            }
+            for (int j = 1; j <= s->fft_size / 4; ++j) {
+                int kk = k + j; if (kk >= s->fft_size) kk -= s->fft_size;
+                if (s->power_avg[kk] < skirt) break;
+                right = j;
+            }
+            const float bw_est = (float)(left + right + 1) * bin_hz;
+            /* LoRa minimum BW preset is 62.5 kHz -- give a margin and require
+             * >= 50 kHz to fire. Caller can still see narrower stuff via
+             * --scan or the spectrum tab; we just won't promote-to-alert it. */
+            if (bw_est < 50000.0f) continue;
             scanner_discovery_t disc = {
                 .f_hz           = d->f_hz,
-                .snr_db         = 10.0f * log10f(s->power_avg[k] / noise),
-                .bw_hz_estimate = (float)((double)s->samp_rate / (double)s->fft_size),
+                .snr_db         = 10.0f * log10f(peak_pow / noise),
+                .bw_hz_estimate = bw_est,
                 .sf_estimate    = 0,
                 .cr_estimate    = 0,
             };
