@@ -10,12 +10,16 @@ Sister project to [iridium-sniffer](https://github.com/alphafox02/iridium-sniffe
 - All Meshtastic regions: US (902-928), EU_868, EU_433, CN, JP, ANZ, KR, TW, RU, IN, NZ_865, TH, UA_433, UA_868, MY_433, MY_919, SG_923, KZ_433, KZ_863, NP_865, BR_902, PH_433/868/915, LORA_24
 - All 9 standard presets: ShortTurbo, ShortFast, ShortSlow, MediumFast, MediumSlow, LongFast, LongMod, LongSlow, LongTurbo
 - Multi-key AES-128 / AES-256-CTR with 1-byte channel-hash routing -- adding more keys does NOT slow per-packet decode (steady state: 1 AES op per packet)
-- Per-port protobuf decode for `TEXT_MESSAGE_APP`, `POSITION_APP`, `NODEINFO_APP`, `TELEMETRY_APP` (DeviceMetrics + EnvironmentMetrics + PowerMetrics), `ROUTING_APP`, `TRACEROUTE_APP`, `WAYPOINT_APP`, `ADMIN_APP`, `NEIGHBORINFO_APP`, `KEY_VERIFICATION_APP`, `MAP_REPORT_APP`, `ATAK_PLUGIN`. Other ports surface as raw bytes in JSON.
+- Per-port protobuf decode for `TEXT_MESSAGE_APP`, `POSITION_APP`, `NODEINFO_APP`, `TELEMETRY_APP` (DeviceMetrics + EnvironmentMetrics + PowerMetrics), `ROUTING_APP`, `TRACEROUTE_APP`, `WAYPOINT_APP`, `ADMIN_APP`, `NEIGHBORINFO_APP`, `KEY_VERIFICATION_APP`, `MAP_REPORT_APP`, `ATAK_PLUGIN`, `REMOTE_HARDWARE_APP`, `DETECTION_SENSOR_APP`, `STORE_FORWARD_APP`, `PAXCOUNTER_APP`. Other ports surface as raw bytes in JSON.
 - ATAK port 72 decoder for `TAKPacket`: callsign, team, role, battery, PLI (lat/lon/alt/speed/course), GeoChat. PLIs republished as CoT XML over multicast (see Outputs).
 - Off-grid LoRa scanner: occupied-bandwidth estimator + 3-confirm threshold flags LoRa-shaped energy outside the configured channel grid
-- Per-frame RSSI/SNR carried through into the JSON event and the dashboard
+- Per-frame RSSI/SNR + on-failure CRC + drift-only CFO telemetry carried through into the JSON event and the dashboard
 - Built-in web dashboard (Live map / Activity / Topology / Config), runtime key + extra-freq additions without restart
-- JSON, UDP, MQTT, ZMQ PUB, CoT XML multicast output sinks
+- JSON, UDP, MQTT, ZMQ PUB, CoT XML multicast, daily-rotated gzipped JSONL archive, libpcap streaming export output sinks
+- PSK dictionary attack against undecrypted frames (`--psk-wordlist=PATH`), GPSDO-friendly geofence ENTRY/EXIT alerts (`--geofence=PATH`), CurveZMQ on the PUB socket (`--zmq-curve-secret=PATH`)
+- Replay-attack flagging on duplicate `(from, packet_id)` tuples beyond the normal mesh retransmit window
+- Multi-station deployment: emit ZMQ telemetry to a [meshtastic-fusion](fusion/) aggregator, optionally self-register via `--announce-to=URL`, optional outbound DEALER socket (`--c2-dealer=tcp://fusion:7009`) for NAT-friendly C2
+- `--schema` dumps the JSON event schema (JSON Schema 2020-12) so SIEM consumers can validate without guessing
 - AddressSanitizer- and ThreadSanitizer-clean build / smoke-test pipeline
 
 ## Use cases
@@ -23,8 +27,8 @@ Sister project to [iridium-sniffer](https://github.com/alphafox02/iridium-sniffe
 The same passive observer fits three operational shapes:
 
 - **Operator / surveyor** -- ham, EmComm coordinator, community organizer. "What Meshtastic networks operate in my area? How busy is each preset? Are nodes reaching each other?" Live map + Activity + Topology tabs. Default keys supplied.
-- **Pen tester / red team** -- authorized engagement on a target's mesh. "Do they use default channel keys? Are admin commands flying around unsigned? What's their actual range envelope?" JSON feed for tooling, future PCAP/Wireshark export, future PSK dictionary attack.
-- **Defensive monitoring** -- site security wanting to know what's leaving the perimeter via LoRa. Off-grid scanner + long-running JSON archive + alerting integration.
+- **Pen tester / red team** -- authorized engagement on a target's mesh. "Do they use default channel keys? Are admin commands flying around unsigned? What's their actual range envelope?" JSON feed for tooling, libpcap streaming export (`--pcap=PATH` / `--pcap-fifo=PATH` for live Wireshark), PSK dictionary attack against unknown channels (`--psk-wordlist=PATH`).
+- **Defensive monitoring** -- site security wanting to know what's leaving the perimeter via LoRa. Off-grid scanner + daily-rotated gzipped JSONL archive (`--archive=DIR`) + geofence ENTRY/EXIT alerts (`--geofence=PATH`).
 
 The core is honest passive observation; the use case is mostly which outputs you wire up and which dashboard tabs you stare at.
 
@@ -52,8 +56,10 @@ The number of channels you stare at simultaneously is set by the SDR's analog ba
 
 - **JSON feed** to stdout (always when running) and to UDP endpoints (`--feed=HOST:PORT`, repeatable)
 - **MQTT** publish (`--mqtt=HOST[:PORT]`, topic `meshtastic/<station-id>` by default, override with `--mqtt-topic`)
-- **ZMQ PUB** for multi-consumer (`--zmq=tcp://*:7008`)
+- **ZMQ PUB** for multi-consumer (`--zmq=tcp://*:7008`); optional CurveZMQ encryption with `--zmq-curve-secret=PATH` (generate keypair via `--zmq-curve-keygen=PATH`)
 - **CoT XML multicast** (`--cot-multicast=239.2.3.1:6969`) -- republishes every positioned node (regular Meshtastic POSITION packets *and* ATAK PLIs) as Cursor-on-Target XML to a multicast group. Any LAN ATAK-CIV / WinTAK / iTAK picks them up automatically -- no TAK Server required. CoT UIDs are prefixed with `--station-id` when set so multi-station deployments don't collide.
+- **PCAP** streaming export (`--pcap=PATH` for a rotating file, `--pcap-fifo=PATH` for a named pipe Wireshark can attach to live). Each LoRa frame is wrapped in DLT_USER0 with a libpcap header.
+- **Daily-rotated gzipped JSONL archive** (`--archive=DIR`) -- every emitted event appended to `DIR/meshtastic-YYYYMMDD.jsonl.gz`, rotated at UTC midnight. SIEM-friendly.
 - **Built-in web dashboard** (`--web=8888`) -- four tabs (see below)
 
 ## Web dashboard
@@ -65,7 +71,13 @@ The number of channels you stare at simultaneously is set by the SDR's analog ba
 - **Topology** -- force-directed graph. Nodes sized by frame count, edges colored by SNR. Real edges from `NEIGHBORINFO_APP` packets and resolved relay-hop hints. A synthetic "RX" station at canvas center has a faint dashed pseudo-edge to every node this sniffer hears, so even a sparse mesh with no NEIGHBORINFO traffic gives a useful picture (what *you* are receiving). Hover to highlight; click any real node to open the drawer.
 - **Config** -- runtime forms for adding keys, importing `meshtastic.org/e/` channel-share URLs, adding extra-frequency decoder slots, changing CoT multicast destination -- all without restarting the binary.
 
-Equivalent endpoints exposed at `POST /api/keys`, `POST /api/share-url`, `POST /api/extra-freq`, `POST /api/cot-multicast` for scripting.
+Equivalent endpoints exposed at `POST /api/keys`, `POST /api/share-url`, `POST /api/extra-freq`, `POST /api/cot-multicast` for scripting. Optional bearer-token auth via `--api-token=SECRET` (clients send `Authorization: Bearer SECRET`).
+
+## JSON event format
+
+`./meshtastic-sniffer --schema` dumps the canonical JSON Schema 2020-12 for every event the binary emits. Key per-frame fields: `from`, `to`, `packet_id`, `channel_hash` (1-byte routing hash from the radio header), optional `slot_id` (which polyphase channelizer slot caught the frame), `hop_limit`/`hop_start`, `rssi_db`/`snr_db`. Quality telemetry only appears when actionable: `payload_crc_ok: false` if a CRC was present and failed, `cfo_hz` only when |drift| > 100 Hz. Per-port decoded fields (text, lat/lon, telemetry, etc.) appear when the channel key is known and the payload parses. Top-level `event` discriminator distinguishes `STATS`, `OFF_GRID_LORA`, `REPLAY_SUSPECTED`, `GEOFENCE_ENTRY`/`GEOFENCE_EXIT`, `PSK_DISCOVERED` from regular packet events.
+
+The JSON wire format changed in May 2026: the per-event `channel` field was renamed to `channel_hash` to reduce confusion with both decoder slot index and human-readable channel name. Downstream consumers reading the old field name need a one-line rename.
 
 ## Stats heartbeat
 
@@ -193,8 +205,9 @@ The generator builds a real Meshtastic frame (16-byte radio header + AES-128-CTR
 Things this tool does not do today:
 
 - No direction finding from a single SDR -- amplitude alone can't localize an emitter
-- No PCAP export for Wireshark workflows; output is JSON-only
-- 12 of the known port numbers are decoded into structured fields; others surface as raw bytes in the JSON event
+- 16 of the known port numbers are decoded into structured fields; others surface as raw bytes in the JSON event
+- AdminMessage signature verification (ed25519) is not implemented yet -- admin packets are decoded but not validated
+- CurveZMQ is sniffer-side only; the Go-based [meshtastic-fusion](fusion/) aggregator can't yet authenticate to a CURVE-protected PUB (limitation of `go-zeromq/zmq4` v0.17). Use a libzmq-based proxy or VPN-gate the link.
 
 ## License
 

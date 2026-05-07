@@ -1,6 +1,6 @@
 # meshtastic-sniffer architecture
 
-Single-binary wideband Meshtastic LoRa receiver. One SDR -> one wide IQ stream -> polyphase channelizer -> N parallel LoRa decoders -> AES-CTR + protobuf decode -> 5 output sinks.
+Single-binary wideband Meshtastic LoRa receiver. One SDR -> one wide IQ stream -> polyphase channelizer -> N parallel LoRa decoders -> AES-CTR + protobuf decode -> stdout / UDP / MQTT / ZMQ (optional CurveZMQ) / CoT multicast / PCAP file or fifo / daily-rotated gzipped JSONL archive / web SSE.
 
 ## Pipeline
 
@@ -42,9 +42,20 @@ Single-binary wideband Meshtastic LoRa receiver. One SDR -> one wide IQ stream -
             |        +-- stdout JSON
             |        +-- UDP feed (--feed=HOST:PORT, repeatable)
             |        +-- MQTT (--mqtt=HOST[:PORT], topic meshtastic/<station>)
-            |        +-- ZMQ PUB (--zmq=tcp://*:7008)
+            |        +-- ZMQ PUB (--zmq=tcp://*:7008, optional CurveZMQ via
+            |        |   --zmq-curve-secret=PATH; --zmq-curve-keygen=PATH
+            |        |   creates the keypair)
             |        +-- CoT XML multicast (--cot-multicast=GROUP:PORT)
+            |        +-- libpcap (--pcap=PATH file or --pcap-fifo=PATH for
+            |        |   live Wireshark via DLT_USER0)
+            |        +-- Daily gzipped JSONL archive (--archive=DIR)
+            |        +-- Geofence ENTRY/EXIT events (--geofence=PATH)
             |        +-- Web SSE (--web=PORT, all events tee'd to /events)
+            |
+            +-- psk_dict.c (when --psk-wordlist=PATH)
+            |    background thread tries each wordlist entry against
+            |    undecrypted frames; discovered keys auto-add to keyset
+            |    and emit a PSK_DISCOVERED event.
             |
             +-- scanner_feed_*()  (when --scan / --scan-and-decode / --alert-off-grid)
                      |
@@ -56,30 +67,40 @@ Single-binary wideband Meshtastic LoRa receiver. One SDR -> one wide IQ stream -
 
 ## File map
 
-| File | Lines | Purpose |
-|---|---:|---|
-| main.c | 1289 | entry point, channel-set builder, signal handling, dedup drainer, stats heartbeat |
-| options.{c,h} | 528 | full CLI parser, shared runtime state, per-backend gain controls |
-| meshtastic.{c,h} | 350 | regions, presets, port enum, channel-hash, default PSK, AES nonce layout |
-| channelizer.{c,h} | 372 | groups channels by `(bw_hz, os_factor)`, one PFB per group, atomic n_channels for runtime add |
-| pfb.{c,h} | 405 | critically-sampled M-channel polyphase filterbank: pre-shift NCO + forward commutator + per-branch FIR + forward FFT |
-| lora.{c,h} | 1269 | LoRa CSS demod (state machine + Gray + Hamming + dewhiten + CRC + FFTW3f dechirp) -- bit-level stages ported from gr-lora_sdr |
-| keyset.{c,h} | 341 | multi-key dispatch, channel-hash buckets, rwlock for runtime add |
-| protobuf.{c,h} | 122 | minimal varint/tag/wire-type reader |
-| mesh_packet.{c,h} | 379 | radio header, AES-CTR via OpenSSL, multi-key try, Data envelope |
-| mesh_decoders.{c,h} | 867 | 12 per-port decoders |
-| node_db.{c,h} | 95 | id -> name cache, used by CoT for callsigns |
-| feed.{c,h} | 514 | JSON serialiser, fanout to stdout/UDP/MQTT/ZMQ/CoT/web |
-| mqtt.c | 85 | libmosquitto sink (stub if not present) |
-| zmq_pub.c | 73 | libzmq PUB sink (stub if not present) |
-| cot.{c,h} | 293 | CoT XML for ATAK PLIs and POSITION packets, multicast, runtime endpoint |
-| scanner.{c,h} | 369 | wideband FFT, off-grid energy detector with occupied-BW estimate, spectrum snapshot |
-| web.{c,h} | 1587 | HTTP+SSE server, embedded Leaflet/Activity/Topology dashboard, /api/* endpoints |
-| sigmf.{c,h} | 136 | .sigmf-meta reader for --file auto-config |
-| file_src.{c,h} | 135 | CI8/CI16/CF32 IQ replay |
-| hackrf/bladerf/rtlsdr/soapysdr/sdrplay/airspy/usrp/vita49.c | 2097 | 8 SDR backends |
-| simd_*.{c,h} | 1649 | AVX2/SSE4.2/NEON/generic kernels (one per ISA tier, runtime-detected) |
-| blocking_queue.h, fair_lock.h | 848 | MIT-licensed primitives (vendored, Felipe Kersting) |
+| File | Purpose |
+|---|---|
+| main.c | entry point, channel-set builder, signal handling, dedup ring + drainer, drainer-watchdog + stragglers counter, stats heartbeat, replay-attack flagging |
+| options.{c,h} | full CLI parser, shared runtime state, per-backend gain controls |
+| meshtastic.{c,h} | regions, presets, port enum, channel-hash, default PSK, AES nonce layout |
+| channelizer.{c,h} | groups channels by `(bw_hz, os_factor)`, one PFB per group, atomic n_channels for runtime add |
+| pfb.{c,h} | critically-sampled M-channel polyphase filterbank: pre-shift NCO + forward commutator + per-branch FIR + forward FFT |
+| lora.{c,h} | LoRa CSS demod (state machine + Gray + Hamming + dewhiten + CRC + FFTW3f dechirp) -- bit-level stages ported from gr-lora_sdr |
+| keyset.{c,h} | multi-key dispatch, channel-hash buckets, rwlock for runtime add; `keyset_add_raw` for hash-only inserts from PSK dictionary attack |
+| psk_dict.{c,h} | background dictionary attack on undecrypted frames; on success adds the discovered key and emits PSK_DISCOVERED |
+| protobuf.{c,h} | minimal varint/tag/wire-type reader |
+| mesh_packet.{c,h} | radio header, AES-CTR via OpenSSL, multi-key try, Data envelope |
+| mesh_decoders.{c,h} | 16 per-port decoders (POSITION, NODEINFO, TELEMETRY, ROUTING, TRACEROUTE, WAYPOINT, ADMIN, NEIGHBORINFO, KEY_VERIFICATION, MAP_REPORT, ATAK_PLUGIN, REMOTE_HARDWARE, DETECTION_SENSOR, PAXCOUNTER, STORE_FORWARD; TEXT_MESSAGE handled inline) |
+| node_db.{c,h} | id -> name cache, used by CoT for callsigns |
+| feed.{c,h} | JSON serialiser, fanout to stdout/UDP/MQTT/ZMQ/CoT/PCAP/archive/geofence/web |
+| mqtt.c | libmosquitto sink (stub if not present) |
+| zmq_pub.c | libzmq PUB sink (stub if not present); CurveZMQ server-side wiring |
+| cot.{c,h} | CoT XML for ATAK PLIs and POSITION packets, multicast, runtime endpoint |
+| pcap_out.{c,h} | libpcap streaming export; rotating file or named-pipe FIFO for live Wireshark, DLT_USER0 |
+| archive.{c,h} | daily-rotated gzipped JSONL archive (`meshtastic-YYYYMMDD.jsonl.gz`) for SIEM ingest |
+| geofence.{c,h} | INI-style polygon parser; ray-cast point-in-polygon; emits ENTRY/EXIT events |
+| announce.{c,h} | `--announce-to=URL` periodic POST of this sensor's registry entry to fusion |
+| c2.{c,h} | transport-independent C2 dispatch (`keys_add`, `share_url`, `extra_freq`, `cot_multicast`); shared between HTTP and DEALER paths |
+| c2_dealer.{c,h} | outbound ZMQ DEALER socket (`--c2-dealer=tcp://fusion:7009`) for NAT-friendly C2; heartbeats + reply matching |
+| schema.{c,h} | static JSON Schema 2020-12 definition emitted by `--schema` |
+| scanner.{c,h} | wideband FFT, off-grid energy detector with occupied-BW estimate, spectrum snapshot |
+| web.{c,h} | HTTP+SSE server, embedded Leaflet/Activity/Topology dashboard, `/api/*` endpoints with optional `--api-token` bearer auth |
+| gpsd.{c,h} | gpsd client tagging events with station_lat/station_lon/station_alt_m |
+| sigmf.{c,h} | `.sigmf-meta` reader for --file auto-config |
+| file_src.{c,h} | CI8/CI16/CF32 IQ replay |
+| hackrf/bladerf/rtlsdr/soapysdr/sdrplay/airspy/usrp/vita49.c | 8 SDR backends |
+| simd_*.{c,h} | AVX2/SSE4.2/NEON/generic kernels (one per ISA tier, runtime-detected) |
+| blocking_queue.h, fair_lock.h | MIT-licensed primitives (vendored, Felipe Kersting) |
+| fusion/ | Go binary `meshtastic-fusion`: aggregator that subscribes to N sniffer ZMQ feeds, fans HTTP / DEALER C2 commands back, exposes a 5-tab dashboard. See [fusion/README.md](fusion/README.md). |
 
 Build is warning-free with `-Wall -Wextra -Werror=implicit-function-declaration`. AddressSanitizer + UndefinedBehaviorSanitizer + ThreadSanitizer all clean against the smoke-test suite.
 
@@ -110,6 +131,8 @@ Implementation in `main.c`:
 Density-safe: 100 simultaneous distinct transmissions create 100 distinct clusters (random fingerprints don't collide within 14 Hamming bits). The 30 ms window swallows leakage cluster from a single chirp without merging adjacent unrelated transmissions.
 
 Result: one JSON line per real transmission, regardless of how many leakage replicas the channelizer emitted.
+
+The drainer thread stamps a wall-clock heartbeat (`g_drainer_last_tick_us`) every 5 ms tick. The stats heartbeat checks this each cycle; if the drainer has gone silent for more than 5x the dedup window (150 ms), `[stats] WARN dedup drainer silent for ...` lands on stderr -- so a wedged drainer surfaces within seconds rather than silently swallowing every frame. A `g_dedup_stragglers` atomic counts emits that came in more than 2x the window late (CPU-saturation diagnostic) and ships out in the SSE STATS event so the dashboard can show it.
 
 ## Threading
 
