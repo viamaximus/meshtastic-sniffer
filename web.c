@@ -17,6 +17,7 @@
 
 #define _GNU_SOURCE
 #include "web.h"
+#include "c2.h"
 #include "cot.h"
 #include "keyset.h"
 #include "options.h"
@@ -1237,7 +1238,7 @@ static int ct_str_eq(const char *a, const char *b)
     return diff == 0;
 }
 
-/* Bearer-token auth check on POST /api/* requests.
+/* Bearer-token auth check on POST /api endpoints.
  *
  * Returns 1 if the request is authorised (either no token is configured,
  * or the request carries the correct 'Authorization: Bearer SECRET' header).
@@ -1550,69 +1551,38 @@ static void *web_thread(void *arg)
         else if (strncmp(buf, "GET /events", 11) == 0) promote_to_sse(fd);
         else if (strncmp(buf, "POST /api/keys", 14) == 0) {
             if (!api_auth_ok(buf, fd)) { close(fd); continue; }
-            const char *body = find_body(buf);
-            keyset_t *ks = app_get_keyset();
-            if (!body || !ks) { send_response(fd, 400, "{\"error\":\"no body or no keyset\"}"); continue; }
-            int added = keyset_parse_csv(ks, body);
-            char resp[64]; snprintf(resp, sizeof(resp), "{\"added\":%d}", added);
-            send_response(fd, 200, resp);
+            c2_response_t r;
+            c2_keys_add(find_body(buf), &r);
+            send_response(fd, r.status, r.body);
         }
         else if (strncmp(buf, "POST /api/share-url", 19) == 0) {
             if (!api_auth_ok(buf, fd)) { close(fd); continue; }
             const char *body = find_body(buf);
-            keyset_t *ks = app_get_keyset();
-            if (!body || !ks) { send_response(fd, 400, "{\"error\":\"no body or no keyset\"}"); continue; }
-            char dec[1024]; size_t bl = strlen(body);
-            if (bl >= sizeof(dec)) bl = sizeof(dec) - 1;
-            memcpy(dec, body, bl); dec[bl] = 0;
-            url_decode_inplace(dec);
-            int added = decode_channel_share(ks, dec);
-            char resp[64];
-            if (added < 0) { send_response(fd, 400, "{\"error\":\"could not parse share URL\"}"); continue; }
-            snprintf(resp, sizeof(resp), "{\"added\":%d}", added);
-            send_response(fd, 200, resp);
+            c2_response_t r;
+            /* HTTP-form bodies arrive URL-encoded; decode before dispatch.
+             * The share-URL parser itself is transport-agnostic in c2.c. */
+            if (!body) { c2_share_url(NULL, &r); }
+            else {
+                char dec[1024];
+                size_t bl = strlen(body);
+                if (bl >= sizeof(dec)) bl = sizeof(dec) - 1;
+                memcpy(dec, body, bl); dec[bl] = 0;
+                url_decode_inplace(dec);
+                c2_share_url(dec, &r);
+            }
+            send_response(fd, r.status, r.body);
         }
         else if (strncmp(buf, "POST /api/extra-freq", 20) == 0) {
             if (!api_auth_ok(buf, fd)) { close(fd); continue; }
-            const char *body = find_body(buf);
-            if (!body) { send_response(fd, 400, "{\"error\":\"no body\"}"); continue; }
-            /* Format: "HZ:bw=BW:sf=SF:cr=CR" -- match CLI parser. */
-            uint64_t f = strtoull(body, NULL, 10);
-            int bw = 250000, sf = 11, cr = 5;
-            const char *p = body;
-            while ((p = strchr(p, ':')) != NULL) {
-                ++p;
-                if (!strncmp(p, "bw=", 3)) bw = atoi(p + 3);
-                else if (!strncmp(p, "sf=", 3)) sf = atoi(p + 3);
-                else if (!strncmp(p, "cr=", 3)) cr = atoi(p + 3);
-            }
-            int id = (f && bw) ? app_add_runtime_extra_freq(f, bw, sf, cr) : -1;
-            char resp[64];
-            if (id < 0) { send_response(fd, 400, "{\"error\":\"add failed\"}"); continue; }
-            snprintf(resp, sizeof(resp), "{\"channel_id\":%d}", id);
-            send_response(fd, 200, resp);
+            c2_response_t r;
+            c2_extra_freq(find_body(buf), &r);
+            send_response(fd, r.status, r.body);
         }
         else if (strncmp(buf, "POST /api/cot-multicast", 23) == 0) {
             if (!api_auth_ok(buf, fd)) { close(fd); continue; }
-            const char *body = find_body(buf);
-            if (!body) { send_response(fd, 400, "{\"error\":\"no body\"}"); continue; }
-            /* Body: "HOST:PORT" or empty to disable. */
-            char host[64]; int port = 6969;
-            const char *colon = strchr(body, ':');
-            if (!colon || !*body) {
-                cot_set_endpoint(NULL, 0);
-                send_response(fd, 200, "{\"enabled\":false}");
-                continue;
-            }
-            size_t hl = (size_t)(colon - body);
-            if (hl >= sizeof(host)) hl = sizeof(host) - 1;
-            memcpy(host, body, hl); host[hl] = 0;
-            port = atoi(colon + 1);
-            int rc = cot_set_endpoint(host, port);
-            char resp[128];
-            if (rc < 0) { send_response(fd, 400, "{\"error\":\"could not bind multicast\"}"); continue; }
-            snprintf(resp, sizeof(resp), "{\"enabled\":true,\"host\":\"%s\",\"port\":%d}", host, port);
-            send_response(fd, 200, resp);
+            c2_response_t r;
+            c2_cot_multicast(find_body(buf), &r);
+            send_response(fd, r.status, r.body);
         }
         else serve_404(fd);
     }
