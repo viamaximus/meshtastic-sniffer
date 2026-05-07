@@ -100,7 +100,8 @@ Single-binary wideband Meshtastic LoRa receiver. One SDR -> one wide IQ stream -
 | hackrf/bladerf/rtlsdr/soapysdr/sdrplay/airspy/usrp/vita49.c | 8 SDR backends |
 | simd_*.{c,h} | AVX2/SSE4.2/NEON/generic kernels (one per ISA tier, runtime-detected) |
 | blocking_queue.h, fair_lock.h | MIT-licensed primitives (vendored, Felipe Kersting) |
-| fusion/ | Go binary `meshtastic-fusion`: aggregator that subscribes to N sniffer ZMQ feeds, fans HTTP / DEALER C2 commands back, exposes a 5-tab dashboard. See [fusion/README.md](fusion/README.md). |
+| fusion/ | Go binary `meshtastic-fusion`: aggregator that subscribes to N sniffer ZMQ feeds, fans HTTP / DEALER C2 commands back, exposes a 5-tab dashboard. Includes hyperbolic-TDOA mlat solver in `fusion/mlat.go` that emits `GEOLOCATED` events when 3+ time-disciplined stations hear the same `(from, packet_id)`. See [fusion/README.md](fusion/README.md). |
+| recover/ | Companion CLI binary `meshtastic-recover`: offline PSK recovery from a captured pcap + wordlist. Reuses `keyset.c`, `mesh_packet.c`, `meshtastic.c`, `protobuf.c` from the parent. OpenMP-parallel candidate loop with channel-hash 8-bit prefilter. Also produces hashcat-compatible hash files via `--hashcat-export=PATH` for the upcoming hashcat custom-mode plugin. See [recover/README.md](recover/README.md). |
 
 Build is warning-free with `-Wall -Wextra -Werror=implicit-function-declaration`. AddressSanitizer + UndefinedBehaviorSanitizer + ThreadSanitizer all clean against the smoke-test suite.
 

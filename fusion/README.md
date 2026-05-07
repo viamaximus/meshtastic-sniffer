@@ -9,6 +9,7 @@ A separate Go binary so it can be deployed on a different host than the SDR-atta
 ## What it does today
 
 - **Subscribes** to one or more sniffers' ZMQ PUB sockets (`--zmq=tcp://*:7008` on the sniffer side)
+- **Multilateration (TDOA)**: when 3+ sensors with known positions and `station_t_ns` timestamps hear the same `(from, packet_id)` within the dedup window, the fusion runs a hyperbolic-TDOA solver (Levenberg-Marquardt, multi-start to break the 3-station hyperbolic ambiguity) and emits a `GEOLOCATED` event with the estimated emitter lat/lon and 1-sigma uncertainty in meters. The Live tab map renders these as magenta diamond markers with a confidence-radius circle. Position accuracy depends entirely on each sensor's clock-discipline class: ~5-30 m with GPSDO+1PPS Tier-1 stations, ~300 m with chrony+PPS Tier-2 stations, useless with NTP-only Tier-3 stations (the solver weights each observation by `1/station_t_acc_ns` so well-disciplined stations dominate).
 - **Persistent sensor registry** at `~/.config/meshtastic-fusion/sensors.json` (or `--sensors-file=PATH`); add/remove via the dashboard's Sensors tab or `POST /api/sensors`, `DELETE /api/sensors/<name>`
 - **Live dashboard** at `--listen=:9000` with five tabs:
   - **Live**: Leaflet map with per-station markers (distinct color per sensor) and per-node markers, plus side tables showing stations and recently-seen nodes with "heard by" attribution

@@ -52,6 +52,17 @@ The number of channels you stare at simultaneously is set by the SDR's analog ba
 
 `./meshtastic-sniffer --rate=20000000 --region=US --presets=all` -- without `--center`, the binary picks a sensible center from region + preset midpoints, logs the resolved coverage window, and warns if a user-supplied `--center` falls outside the configured region.
 
+### HackRF tuning notes
+
+The single `--gain=DB` knob maps across HackRF's three independent stages, but real-world deployments often benefit from per-knob control. Use `--hackrf-lna=N` (0..40 step 8), `--hackrf-vga=N` (0..62 step 2), and `--hackrf-amp` / `--hackrf-amp-off` to set them explicitly.
+
+**Watch out for close-range desense.** A Meshtastic node sitting 1-2 meters from your HackRF antenna can produce enough RF to overload the analog mixer regardless of LNA gain — the ADC won't clip (signal looks fine), but mixer intermodulation products inside the band corrupt the demod's symbol detection. Symptoms: high SNR (25-30 dB) but every frame from the close node has `payload_crc_ok: false`, and the topology fills with bit-flipped phantom node IDs (`!471c1b98` instead of the real `!433c0b98`, etc.). Two practical fixes:
+
+- Move the HackRF physically further from the node (5+ ft / different room).
+- Inline a 6-10 dB SMA pad between the antenna and HackRF.
+
+Distant signals are unaffected by this and decode cleanly even with the close node hammering the front end. The `payload_crc_ok` field is the diagnostic; if you only see CRC failures from one specific node and clean frames from others, it's RF physics not a software bug.
+
 ## Outputs
 
 - **JSON feed** to stdout (always when running) and to UDP endpoints (`--feed=HOST:PORT`, repeatable)
@@ -75,7 +86,26 @@ Equivalent endpoints exposed at `POST /api/keys`, `POST /api/share-url`, `POST /
 
 ## JSON event format
 
-`./meshtastic-sniffer --schema` dumps the canonical JSON Schema 2020-12 for every event the binary emits. Key per-frame fields: `from`, `to`, `packet_id`, `channel_hash` (1-byte routing hash from the radio header), optional `slot_id` (which polyphase channelizer slot caught the frame), `hop_limit`/`hop_start`, `rssi_db`/`snr_db`. Quality telemetry only appears when actionable: `payload_crc_ok: false` if a CRC was present and failed, `cfo_hz` only when |drift| > 100 Hz. Per-port decoded fields (text, lat/lon, telemetry, etc.) appear when the channel key is known and the payload parses. Top-level `event` discriminator distinguishes `STATS`, `OFF_GRID_LORA`, `REPLAY_SUSPECTED`, `GEOFENCE_ENTRY`/`GEOFENCE_EXIT`, `PSK_DISCOVERED` from regular packet events.
+`./meshtastic-sniffer --schema` dumps the canonical JSON Schema 2020-12 for every event the binary emits.
+
+**Per-frame fields:** `from`, `to`, `packet_id`, `channel_hash` (1-byte routing hash from the radio header), optional `slot_id` (which polyphase channelizer slot caught the frame), `hop_limit`/`hop_start`, `rssi_db`/`snr_db`.
+
+**Quality telemetry — silent when healthy, present when actionable:**
+- `payload_crc_ok: false` — CRC was present and failed (frame bytes are corrupt; absence implies CRC passed)
+- `cfo_hz` — only when |drift| > 100 Hz (radio is well-tuned otherwise)
+
+**Multilateration timing:** `station_t_ns` (host-realtime ns at first-replica receive) + `station_t_acc_ns` (operator-self-reported clock-discipline class). Set `--station-t-acc-ns=N` per station: 100 for GPSDO+1PPS, 1000 for chrony+PPS, 1000000 (default) for NTP-class. The fusion-side mlat solver weights observations by this value.
+
+**Decoded-port fields** (text, lat/lon, telemetry, etc.) appear only when the channel key is known *and* the payload parses *and* the LoRa CRC passed. CRC-failed frames are gated explicitly: even when AES-CTR happens to produce parseable-looking bytes from corrupt ciphertext, those bytes are suppressed and the frame is reported as `decrypted: false`. This prevents fictitious POSITION / TEXT_MESSAGE decodes from showing up on the dashboard or in the JSON feed.
+
+**Top-level `event` discriminator** distinguishes from regular packet events:
+- `STATS` — periodic msps + cumulative frames + decryption rate
+- `OFF_GRID_LORA` — scanner detected LoRa-shaped energy outside the configured grid
+- `REPLAY_SUSPECTED` — duplicate `(from, packet_id)` outside the normal mesh retransmit window
+- `GEOFENCE_ENTRY` / `GEOFENCE_EXIT` — positioned node crossed a polygon boundary
+- `PSK_DISCOVERED` — `--psk-wordlist` attack found a key
+- `GEOLOCATED` — fusion-side mlat solver produced an emitter position estimate
+- `HEARTBEAT` — DEALER C2 session keepalive (when `--c2-dealer` is configured)
 
 The JSON wire format changed in May 2026: the per-event `channel` field was renamed to `channel_hash` to reduce confusion with both decoder slot index and human-readable channel name. Downstream consumers reading the old field name need a one-line rename.
 
@@ -220,10 +250,30 @@ The generator builds a real Meshtastic frame (16-byte radio header + AES-128-CTR
 
 Things this tool does not do today:
 
-- No direction finding from a single SDR -- amplitude alone can't localize an emitter
+- No direction finding from a single SDR -- amplitude alone can't localize an emitter. Multilateration via 3+ stations works but requires GPSDO-locked SDRs for sub-100m accuracy (Tier-1); chrony+PPS hosts give ~300 m (Tier-2).
 - 16 of the known port numbers are decoded into structured fields; others surface as raw bytes in the JSON event
 - AdminMessage signature verification (ed25519) is not implemented yet -- admin packets are decoded but not validated
 - CurveZMQ is sniffer-side only; the Go-based [meshtastic-fusion](fusion/) aggregator can't yet authenticate to a CURVE-protected PUB (limitation of `go-zeromq/zmq4` v0.17). Use a libzmq-based proxy or VPN-gate the link.
+- Close-range front-end overload: a Meshtastic node within 1-2 m of the HackRF antenna corrupts demod via mixer intermodulation regardless of LNA gain. Surfaced via `payload_crc_ok: false`; mitigated by physical separation or an inline RF attenuator. See the *HackRF tuning notes* section above.
+
+## Offline PSK recovery
+
+A companion CLI tool [meshtastic-recover](recover/) reads captured pcaps (`--pcap=PATH`) and a wordlist, runs the same channel-hash prefilter + AES-CTR + protobuf-shape verifier the live decoder uses, and prints any keys that successfully decrypt one or more captured frames. OpenMP-parallel across all CPU cores. Output is in `--keys-file=` compatible format ready to feed back to the sniffer.
+
+```bash
+# Try the firmware default keys (simple1..simple255) against a capture
+./meshtastic-recover --pcap=session.pcap --simple-keys --output=recovered.keys
+
+# Add a passphrase wordlist (keeps default-key trials, adds dictionary attack)
+./meshtastic-recover --pcap=session.pcap --simple-keys --wordlist=/usr/share/dict/words
+
+# Re-decode the same capture using whatever keys were recovered
+./meshtastic-sniffer --file=session.pcap --keys-file=recovered.keys
+```
+
+GPU acceleration via a [hashcat](https://hashcat.net) custom-mode plugin is in progress on a sister branch (`meshtastic-plugin` in our hashcat fork). The recover binary already produces hashcat-compatible hash files via `--hashcat-export=PATH` so the plugin can drop in without format changes when ready. See [recover/README.md](recover/README.md) for the format spec and verifier algorithm.
+
+Realistic attack surface: factory-default channels recover instantly; weak-passphrase channels recover from a rockyou-class wordlist in seconds; channels using a strong randomly-generated 16/32-byte PSK are not feasible to recover.
 
 ## License
 
