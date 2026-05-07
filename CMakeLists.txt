@@ -242,6 +242,25 @@ set_property(TARGET meshtastic-sniffer PROPERTY INTERPROCEDURAL_OPTIMIZATION TRU
 
 install(TARGETS meshtastic-sniffer DESTINATION bin)
 
+# meshtastic-recover: offline PSK recovery from a captured pcap.
+# Reuses keyset / mesh_packet / meshtastic / protobuf from the parent.
+add_executable(meshtastic-recover
+    ${PROJECT_SOURCE_DIR}/recover/meshtastic-recover.c
+    ${PROJECT_SOURCE_DIR}/recover/stubs.c
+    ${PROJECT_SOURCE_DIR}/keyset.c
+    ${PROJECT_SOURCE_DIR}/mesh_packet.c
+    ${PROJECT_SOURCE_DIR}/mesh_decoders.c
+    ${PROJECT_SOURCE_DIR}/meshtastic.c
+    ${PROJECT_SOURCE_DIR}/protobuf.c)
+target_link_libraries(meshtastic-recover PRIVATE
+    Threads::Threads
+    ${OPENSSL_CRYPTO_LIBRARY})
+if(OpenMP_C_FOUND)
+    target_link_libraries(meshtastic-recover PRIVATE OpenMP::OpenMP_C)
+endif()
+set_property(TARGET meshtastic-recover PROPERTY C_STANDARD 99)
+install(TARGETS meshtastic-recover DESTINATION bin)
+
 # CPack
 set(CPACK_PACKAGE_NAME "meshtastic-sniffer")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Wideband Meshtastic LoRa receiver")
