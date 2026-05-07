@@ -1,57 +1,69 @@
 # meshtastic-sniffer
 
-Wideband Meshtastic LoRa receiver written in C. Captures one wide IQ slice from a single SDR and decodes **every Meshtastic channel and preset in the band simultaneously** — no per-channel hopping, no missed packets. With keys supplied, decrypts in parallel: text messages, GPS positions, node info, telemetry, routing, traceroute, ATAK plugin packets, and more — all surfaced from one capture.
+Wideband passive Meshtastic LoRa receiver written in C. Captures one wide IQ slice from a single SDR and decodes **every Meshtastic channel and preset that fits in the slice simultaneously** -- no per-channel hopping, no missed packets. With keys supplied, decrypts in parallel: text messages, GPS positions, node info, telemetry, routing, traceroute, ATAK plugin packets, and more -- all surfaced from one capture.
 
 Sister project to [iridium-sniffer](https://github.com/alphafox02/iridium-sniffer) and [inmarsat-sniffer](https://github.com/alphafox02/inmarsat-sniffer). Same SDR backend matrix, same threading style, same output ecosystem.
 
-## What it decodes
+## Features
 
-- **All Meshtastic regions**: US (902-928), EU_868, EU_433, CN, JP, ANZ, KR, TW, RU, IN, NZ_865, TH, UA_433, UA_868, MY_433, MY_919, SG_923, KZ_433, KZ_863, NP_865, BR_902, PH_433/868/915, LORA_24
-- **All presets**: ShortTurbo, ShortFast, ShortSlow, MediumFast, MediumSlow, LongFast, LongModerate, LongSlow, LongTurbo
-- **All channel slots per preset**, in parallel from one capture (US LongFast = 104 slots at 250 kHz BW)
-- **Multi-key AES-128 / AES-256-CTR** with channel-hash routing — supply many keys, the right one is auto-selected per packet via 1-byte channel hash. Adding more keys does NOT slow per-packet decode (steady state: 1 AES op per packet).
-- **Per-port protobuf decode** for: `TEXT_MESSAGE_APP`, `POSITION_APP`, `NODEINFO_APP`, `TELEMETRY_APP` (DeviceMetrics + EnvironmentMetrics + PowerMetrics), `ROUTING_APP`, `TRACEROUTE_APP`, `WAYPOINT_APP`, `ADMIN_APP` (variant surfaced), `NEIGHBORINFO_APP` (per-neighbour SNR), `KEY_VERIFICATION_APP` (metadata only — hashes never re-emitted), `MAP_REPORT_APP`, `ATAK_PLUGIN`. Other ports surface as raw bytes in JSON.
-- **ATAK port 72 decoder** — `TAKPacket` protobuf: callsign, team, role, battery, PLI (lat/lon/alt/speed/course) and GeoChat (to/text). PLIs are also republished as CoT XML over multicast (see Outputs).
-- **Off-grid scanner** — flags LoRa-shaped energy outside the configured channel grid (hams on 6m/10m, custom-freq nodes, misconfigured devices); one OFF_GRID_LORA event per discovery, 3-confirm threshold to suppress one-shot spikes.
-- **Per-frame RSSI/SNR** carried through from the LoRa demod into the JSON event and the dashboard nodes table.
+- Polyphase filterbank channelizer (AVX2/SSE4.2/NEON SIMD), one wide IQ stream into N parallel per-channel basebands at `Fs/M` each
+- All Meshtastic regions: US (902-928), EU_868, EU_433, CN, JP, ANZ, KR, TW, RU, IN, NZ_865, TH, UA_433, UA_868, MY_433, MY_919, SG_923, KZ_433, KZ_863, NP_865, BR_902, PH_433/868/915, LORA_24
+- All 9 standard presets: ShortTurbo, ShortFast, ShortSlow, MediumFast, MediumSlow, LongFast, LongMod, LongSlow, LongTurbo
+- Multi-key AES-128 / AES-256-CTR with 1-byte channel-hash routing -- adding more keys does NOT slow per-packet decode (steady state: 1 AES op per packet)
+- Per-port protobuf decode for `TEXT_MESSAGE_APP`, `POSITION_APP`, `NODEINFO_APP`, `TELEMETRY_APP` (DeviceMetrics + EnvironmentMetrics + PowerMetrics), `ROUTING_APP`, `TRACEROUTE_APP`, `WAYPOINT_APP`, `ADMIN_APP`, `NEIGHBORINFO_APP`, `KEY_VERIFICATION_APP`, `MAP_REPORT_APP`, `ATAK_PLUGIN`. Other ports surface as raw bytes in JSON.
+- ATAK port 72 decoder for `TAKPacket`: callsign, team, role, battery, PLI (lat/lon/alt/speed/course), GeoChat. PLIs republished as CoT XML over multicast (see Outputs).
+- Off-grid LoRa scanner: occupied-bandwidth estimator + 3-confirm threshold flags LoRa-shaped energy outside the configured channel grid
+- Per-frame RSSI/SNR carried through into the JSON event and the dashboard
+- Built-in web dashboard (Live map / Activity / Topology / Config), runtime key + extra-freq additions without restart
+- JSON, UDP, MQTT, ZMQ PUB, CoT XML multicast output sinks
+- AddressSanitizer- and ThreadSanitizer-clean build / smoke-test pipeline
+
+## Use cases
+
+The same passive observer fits three operational shapes:
+
+- **Operator / surveyor** -- ham, EmComm coordinator, community organizer. "What Meshtastic networks operate in my area? How busy is each preset? Are nodes reaching each other?" Live map + Activity + Topology tabs. Default keys supplied.
+- **Pen tester / red team** -- authorized engagement on a target's mesh. "Do they use default channel keys? Are admin commands flying around unsigned? What's their actual range envelope?" JSON feed for tooling, future PCAP/Wireshark export, future PSK dictionary attack.
+- **Defensive monitoring** -- site security wanting to know what's leaving the perimeter via LoRa. Off-grid scanner + long-running JSON archive + alerting integration.
+
+The core is honest passive observation; the use case is mostly which outputs you wire up and which dashboard tabs you stare at.
 
 ## Hardware capacity
 
-The number of presets/channels you can stare at simultaneously is set by the SDR's bandwidth.
+The number of channels you stare at simultaneously is set by the SDR's analog bandwidth and your `--rate`. **Any rate works** -- the channelizer auto-fits whichever channels of the configured grid land inside `[center - rate/2, center + rate/2]`. 56 MHz is the threshold to capture *every* US-band 250 kHz slot from one stare; below that you cover a contiguous subset that the binary picks for you.
 
-| SDR | Bandwidth | Presets in one stare | Notes |
-|-----|-----------|----------------------|-------|
-| HackRF One | 20 MHz | All US presets at 910 MHz center | Matches `meshtastic_sdr` GnuRadio reference |
-| BladeRF 2.0 | 56 MHz | Whole 902-928 ISM with margin | |
-| USRP B210 | 56 MHz | Whole ISM band | |
-| SDRplay RSPdx | 10 MHz | Most presets per region | |
-| Airspy R2 | 10 MHz | Most presets per region | |
-| RTL-SDR (R820T) | 2.4 MHz | One BW group | e.g. all LongFast 250 kHz slots that fit |
-| Custom via SoapySDR | varies | — | |
-| VITA 49 (network) | varies | — | Remote/distributed |
-| IQ file replay | — | — | Offline analysis; auto-loads `.sigmf-meta` sibling |
+| SDR | Bandwidth | Coverage at default rate | Notes |
+|-----|-----------|--------------------------|-------|
+| HackRF One | 20 MHz | 41/104 US LongFast slots, all wider-spaced presets | Most common config; partial cover but every preset is visible |
+| BladeRF 2.0 | 56 MHz | All 104 US LongFast slots | AD9361, full ISM band coverage |
+| USRP B210 | 56 MHz | All 104 US LongFast slots | UHD-driven |
+| SDRplay (RSPdx, RSP1A) | 10 MHz | One BW group + adjacent presets | Native API |
+| Airspy R2 / Mini | 10 MHz | One BW group + adjacent presets | |
+| RTL-SDR (R820T) | 2.4 MHz | One BW group, ~9 LongFast slots | Cheap entry point |
+| Custom via SoapySDR | varies | -- | Generic |
+| VITA-49 / VRT (network) | varies | -- | Remote IQ over UDP from any sender that emits VITA-49 (`[BIND:]PORT`, big-endian VRT signal-data, optional VRL wrapper). Same wire format as iridium-sniffer / inmarsat-sniffer; if a sender works for those, it works for this. |
+| IQ file replay | -- | -- | Offline; auto-loads `.sigmf-meta` sibling for rate/freq/format |
 
 `--list` enumerates all attached SDRs across every compiled-in backend.
+
+`./meshtastic-sniffer --rate=20000000 --region=US --presets=all` -- without `--center`, the binary picks a sensible center from region + preset midpoints, logs the resolved coverage window, and warns if a user-supplied `--center` falls outside the configured region.
 
 ## Outputs
 
 - **JSON feed** to stdout (always when running) and to UDP endpoints (`--feed=HOST:PORT`, repeatable)
 - **MQTT** publish (`--mqtt=HOST[:PORT]`, topic `meshtastic/<station-id>` by default, override with `--mqtt-topic`)
 - **ZMQ PUB** for multi-consumer (`--zmq=tcp://*:7008`)
-- **CoT XML multicast** (`--cot-multicast=239.2.3.1:6969`) — republishes every positioned node (regular Meshtastic POSITION packets *and* ATAK PLIs) as Cursor-on-Target XML to a multicast group. Any LAN ATAK-CIV / WinTAK / iTAK picks them up automatically — no TAK Server required. ATAK PLI packets carry their own callsign/team/role/battery; regular POSITION packets are labelled with the node's `long_name` from the NODEINFO cache. CoT UIDs are prefixed with `--station-id` when set, so multi-station deployments don't collide (`MESH-<station>-<callsign>`).
-- **Built-in web dashboard** (`--web=8888`) — three tabs:
-  - **Live**: Leaflet map with node markers + trail polylines (last 8 fixes per node), nodes table with last SNR per node, **CSV export** button, separate panels for chat messages and discoveries/ATAK events.
-  - **Spectrum** (when `--web-spectrum`): scrolling waterfall canvas with live wideband FFT (256 bins downsampled from the scanner's 4096-bin FFT, 1 Hz update over the SSE stream).
-  - **Config**: runtime forms for adding keys, pasting `meshtastic.org/e/` channel-share URLs, adding extra-frequency decoder slots, and changing the CoT multicast destination — all without restarting the binary.
+- **CoT XML multicast** (`--cot-multicast=239.2.3.1:6969`) -- republishes every positioned node (regular Meshtastic POSITION packets *and* ATAK PLIs) as Cursor-on-Target XML to a multicast group. Any LAN ATAK-CIV / WinTAK / iTAK picks them up automatically -- no TAK Server required. CoT UIDs are prefixed with `--station-id` when set so multi-station deployments don't collide.
+- **Built-in web dashboard** (`--web=8888`) -- four tabs (see below)
 
-## Web Config tab — runtime configuration
+## Web dashboard
 
-The dashboard's Config tab exposes four runtime controls that take effect *without restarting* the binary:
+`--web=8888` opens four tabs:
 
-- **Add keys** (one spec per line — `ChannelName=SPEC`, where SPEC is `default | simpleN | hex:HHHH... | base64:....`). New keys take effect on the very next packet via the precomputed channel-hash dispatch table.
-- **Channel-share URL** — paste a `https://meshtastic.org/e/#...` link; the protobuf payload is decoded into channel name + PSK and added to the keyset.
-- **Add extra frequency** (`HZ:bw=BW:sf=SF:cr=CR`) — promote an off-grid sighting (or any custom freq) to a real decoder slot. Mid-stream channelizer addition; the new decoder picks up samples on the next channelizer step.
-- **CoT multicast** — change or disable the multicast destination on the fly.
+- **Live** -- Leaflet map with node markers + trail polylines (last 8 fixes per node). Nodes table with search box, sortable columns (ID / Name / SNR / Frames / Last seen), CSV export. Click any row to slide in a per-node drawer: name + id, metrics, last-60 SNR sparkline, recent text messages, recent positions, channels-seen-on. Channels table (by hash). Messages and Discoveries panels.
+- **Activity** -- per-preset cards, one per Meshtastic preset (ShortTurbo, ShortFast, ShortSlow, MediumFast, MediumSlow, LongFast, LongMod, LongSlow, LongTurbo). Each card shows fpm (60-second rolling), cumulative frames, decrypted/total channel ratio, sparkline, and the channel sub-list (channel name when decrypted, `(encrypted)` otherwise). Idle presets render greyed.
+- **Topology** -- force-directed graph. Nodes sized by frame count, edges colored by SNR. Real edges from `NEIGHBORINFO_APP` packets and resolved relay-hop hints. A synthetic "RX" station at canvas center has a faint dashed pseudo-edge to every node this sniffer hears, so even a sparse mesh with no NEIGHBORINFO traffic gives a useful picture (what *you* are receiving). Hover to highlight; click any real node to open the drawer.
+- **Config** -- runtime forms for adding keys, importing `meshtastic.org/e/` channel-share URLs, adding extra-frequency decoder slots, changing CoT multicast destination -- all without restarting the binary.
 
 Equivalent endpoints exposed at `POST /api/keys`, `POST /api/share-url`, `POST /api/extra-freq`, `POST /api/cot-multicast` for scripting.
 
@@ -60,12 +72,10 @@ Equivalent endpoints exposed at `POST /api/keys`, `POST /api/share-url`, `POST /
 Every 5 seconds the binary prints a one-line summary to stderr so you can tell at a glance whether samples are flowing and frames are being decoded:
 
 ```
-[stats] 18.45 Msps in, 12 LoRa frames, 9 decrypted, 1 off-grid hits
+[stats] 18.45 Msps in, 12 LoRa frames, 9 decrypted
 ```
 
-## Status
-
-The full pipeline (channelizer + multi-key AES + protobuf + 12 per-port decoders + JSON/MQTT/ZMQ/CoT/web) is wired and validated end-to-end with a synthetic frame round-trip self-test plus a 4-test smoke suite (`tests/test_smoke.sh`). The LoRa CSS frame sync + FFT dechirp DSP is implemented in full structure (preamble detect, dechirp + FFT, Gray, Hamming, dewhitening, CRC) but is awaiting validation against real over-the-air or gr-lora_sdr-generated IQ before being declared production-ready. See `ARCHITECTURE.md` for the full pipeline diagram and design notes.
+`off-grid hits` is appended only when the scanner is enabled (`--scan*` or `--alert-off-grid`).
 
 ## Build
 
@@ -88,9 +98,9 @@ sudo apt install libmosquitto-dev libzmq3-dev
 
 ## First-time use (30 seconds)
 
-You have a Meshtastic node and an SDR (HackRF / RTL-SDR / etc). You want to see what your node and its neighbours are saying.
+You have a Meshtastic node and an SDR. You want to see what your node and its neighbours are saying.
 
-1. **Get your channel key.** In the Meshtastic phone app, open the channel, tap "Share Channel," and copy the URL — it looks like `https://meshtastic.org/e/#CgM...`. That URL contains the channel name and the AES key in a small protobuf payload.
+1. **Get your channel key.** In the Meshtastic phone app, open the channel, tap "Share Channel," and copy the URL -- it looks like `https://meshtastic.org/e/#CgM...`. That URL contains the channel name and the AES key in a small protobuf payload.
 
 2. **Plug in the SDR.** Run `./meshtastic-sniffer --list` to confirm it's detected.
 
@@ -100,11 +110,11 @@ You have a Meshtastic node and an SDR (HackRF / RTL-SDR / etc). You want to see 
    ./meshtastic-sniffer --hackrf --share-url='https://meshtastic.org/e/#CgM...' --web=8888
    ```
 
-   The binary picks a sample rate and center frequency from the SDR + region (`US` by default — override with `--region=EU_868` etc.). It opens the dashboard at `http://localhost:8888`.
+   The binary picks a sample rate and center frequency from the SDR + region (`US` by default -- override with `--region=EU_868` etc.). It opens the dashboard at `http://localhost:8888`.
 
-4. **If nothing shows up after a minute**, check stderr — the binary prints loud warnings when no samples are flowing or no LoRa frames have decoded. Common causes: gain too low (`--gain=40`), wrong region, no node in range.
+4. **If nothing shows up after a minute**, check stderr -- the binary prints loud warnings when no samples are flowing or no LoRa frames have decoded. Common causes: gain too low (`--gain=40`), wrong region, no node in range. The HackRF default is LNA=0 / VGA=30 -- right for close traffic but turn `--gain` up for distant captures.
 
-5. **Adding more channels later:** open the dashboard, click **Config** tab, paste another `meshtastic.org/e/` URL, hit Add. Done — no restart needed.
+5. **Adding more channels later:** open the dashboard, click **Config** tab, paste another `meshtastic.org/e/` URL, hit Add. Done -- no restart needed.
 
 ## Quickstart
 
@@ -123,11 +133,12 @@ You have a Meshtastic node and an SDR (HackRF / RTL-SDR / etc). You want to see 
                     --iq-record=/data/capture-$(date +%s).cs8 \
                     --feed=collector:5588 --station-id=basement-rx --web=8888
 
-# Receive over a network feed (e.g. KrakenSDR / SDR4SPACE / phantomized SDR via VITA-49):
+# Receive over a network feed (any sender that emits VITA-49 VRT):
 ./meshtastic-sniffer --vita49=4991 --keys=default --web=8888
-# (sample rate + center freq come from the VITA-49 context packets automatically)
+# (sample rate + center freq come from the VITA-49 IF-context packets
+#  automatically when the sender emits them; otherwise pin via --rate/--center)
 
-# US LongFast on a HackRF with explicit overrides (the old way, still works):
+# US LongFast on a HackRF with explicit overrides:
 ./meshtastic-sniffer --hackrf --region=US --presets=LongFast \
                     --rate=20000000 --center=910000000 \
                     --keys=default --web=8888
@@ -139,7 +150,7 @@ You have a Meshtastic node and an SDR (HackRF / RTL-SDR / etc). You want to see 
 ./meshtastic-sniffer --hackrf --keys=LongFast=default,Ops=hex:00112233...ff \
                     --feed=collector:5588 --mqtt=mqtt.local \
                     --zmq=tcp://*:7008 --cot-multicast=239.2.3.1:6969 \
-                    --web=8888 --web-spectrum --station-id=basement-rx
+                    --web=8888 --station-id=basement-rx
 
 # Off-grid scan only (no decode, just discover non-standard LoRa freqs):
 ./meshtastic-sniffer --hackrf --scan --alert-off-grid
@@ -168,17 +179,31 @@ The generator builds a real Meshtastic frame (16-byte radio header + AES-128-CTR
 
 `MESHTASTIC_LORA_TRACE=1` enables a per-symbol state-machine trace on stderr, useful for debugging decode against a known-good reference.
 
-## Self-test
+## Self-test and smoke test
 
 `./meshtastic-sniffer --selftest` runs two checks:
 
 1. **Channelizer**: synthesizes a 0.1 sec tone at 902.625 MHz inside a 20 MHz capture centered on 910 MHz; configures four 250 kHz channels at the US LongFast slot 0..3 grid; verifies the tone lands in slot 2 with the expected power profile.
-2. **AES + multi-key + protobuf**: builds a synthetic Meshtastic packet (TEXT_MESSAGE_APP, payload `"Hello"`, encrypted with the default key), runs it through `mesh_packet_decode`, and verifies the callback fires with the right port + payload + channel name.
+2. **AES + multi-key + protobuf**: builds a synthetic Meshtastic packet (`TEXT_MESSAGE_APP`, payload `"Hello"`, encrypted with the default key), runs it through the decode path, and verifies the callback fires with the right port + payload + channel name.
 
-Both must print `PASS`.
+`bash tests/test_smoke.sh` adds SigMF auto-config, `--list`, web `/api/*` round-trip, STATS SSE heartbeat, and stats heartbeat. Both tests run clean under AddressSanitizer + UndefinedBehaviorSanitizer; ThreadSanitizer reports no data races on the keyset rwlock under concurrent `/api/keys` POST load.
+
+## Honest limitations
+
+Things this tool does not do today:
+
+- No direction finding from a single SDR -- amplitude alone can't localize an emitter
+- No PCAP export for Wireshark workflows; output is JSON-only
+- 12 of the known port numbers are decoded into structured fields; others surface as raw bytes in the JSON event
 
 ## License
 
 GPL-3.0-or-later. See `LICENSE`. Copyright (c) 2026 CEMAXECUTER LLC.
 
-This project is independent of and not affiliated with Meshtastic. "Meshtastic" is a trademark of [Meshtastic LLC](https://meshtastic.org). The protocol constants used here are interoperability facts; no proprietary code is included.
+This project is independent of and not affiliated with Meshtastic. "Meshtastic" is a trademark of [Meshtastic LLC](https://meshtastic.org). Protocol constants used here (default PSK, channel hash, AES-CTR nonce layout, region/preset tables) are interoperability facts derived from the upstream firmware at <https://github.com/meshtastic/firmware> (also GPL-3.0-or-later); no proprietary code is included.
+
+### Upstream attribution
+
+- **gr-lora_sdr** by Joachim Tapparel @ EPFL TCL Lab (<https://github.com/tapparelj/gr-lora_sdr>, GPL-3.0-or-later) -- significant portions of `lora.c`'s bit-level decode path (hard-decode Hamming, deinterleave, gray, dewhiten, preamble-mode-vote) are ported from gr-lora_sdr and verified bit-exact against its stage outputs. Per-stage citations appear inline at the relevant call sites in `lora.c`.
+- **Meshtastic firmware** (<https://github.com/meshtastic/firmware>, GPL-3.0-or-later) -- the wire format, default PSK, simpleN PSK derivation, channel-hash function, AES-CTR nonce layout, region/preset tables, and port number assignments are all derived from the upstream firmware. Implementation here is original; only the on-the-air constants come from upstream.
+- **Felipe Kersting** -- `blocking_queue.h` and `fair_lock.h` are vendored MIT-licensed primitives (Copyright (c) 2020). License preserved in each file.

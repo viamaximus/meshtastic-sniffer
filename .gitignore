@@ -26,3 +26,6 @@ compile_commands.json
 # Compiled test binaries / Python caches
 tests/test_lora_stages
 __pycache__/
+
+# Internal planning notes -- not for the public repo.
+ROADMAP.md
