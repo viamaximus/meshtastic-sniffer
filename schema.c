@@ -46,6 +46,8 @@ const char *schema_json_text(void)
 "        \"packet_id\":      { \"type\": \"integer\", \"description\": \"sender-chosen packet identifier\" },\n"
 "        \"channel_hash\":   { \"type\": \"integer\", \"minimum\": 0, \"maximum\": 255, \"description\": \"1-byte channel hash from radio header (xorHash(name) ^ xorHash(psk))\" },\n"
 "        \"slot_id\":        { \"type\": \"integer\", \"minimum\": 0, \"description\": \"polyphase channelizer slot index that caught this frame\" },\n"
+"        \"station_t_ns\":   { \"type\": \"integer\", \"description\": \"first-replica realtime timestamp in nanoseconds since the Unix epoch; consumed by the fusion-side mlat solver\" },\n"
+"        \"station_t_acc_ns\":{ \"type\": \"integer\", \"description\": \"self-reported timestamp accuracy class in ns: <=100 GPSDO+1PPS, <=10000 chrony+PPS, <=1000000 chrony+NTP, larger = unsynchronised\" },\n"
 "        \"hop_limit\":      { \"type\": \"integer\", \"minimum\": 0, \"maximum\": 7 },\n"
 "        \"hop_start\":      { \"type\": \"integer\", \"minimum\": 0, \"maximum\": 7 },\n"
 "        \"relay_node\":     { \"type\": \"integer\", \"description\": \"upper byte of the relayer's node id when present\" },\n"

@@ -62,6 +62,19 @@ typedef struct mesh_event {
     bool           payload_crc_ok;   /* CRC verified; meaningful only when has_crc */
     float          cfo_hz;           /* carrier-frequency offset estimate */
 
+    /* Per-station capture timestamp + self-reported accuracy (ns).
+     * station_t_ns is host wall-clock at receive time (ns since epoch).
+     * station_t_acc_ns is this station's clock-discipline class:
+     *     <= 100         GPSDO + 1PPS-locked SDR sample counter
+     *     <= 10000       chrony + PPS host clock
+     *     <= 1000000     chrony + NTP host clock
+     *     1000000+       unsynchronized / unknown
+     * The fusion-side mlat solver uses station_t_acc_ns to weight
+     * observations; a poorly-synchronized station effectively votes
+     * less than a GPSDO-locked one. 0 means "not populated". */
+    uint64_t       station_t_ns;
+    uint32_t       station_t_acc_ns;
+
     /* Inner Data envelope (when decrypted == true) */
     uint32_t       portnum;
     const uint8_t *payload;

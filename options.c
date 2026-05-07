@@ -96,6 +96,7 @@ char *opt_announce_to             = NULL;
 char *opt_c2_dealer               = NULL;
 char *opt_zmq_curve_secret        = NULL;
 char *opt_zmq_curve_keygen        = NULL;
+uint32_t opt_station_t_acc_ns     = 1000000;  /* 1 ms = NTP-class default; mlat solver weights by this */
 char *opt_cot_multicast           = NULL;
 int   opt_web_port                = 0;
 char *opt_station_id              = NULL;
@@ -225,6 +226,12 @@ void options_print_help(const char *prog)
         "  --zmq-curve-keygen=PATH\n"
         "                         generate a CurveZMQ keypair, write secret to\n"
         "                         PATH and public to PATH.pub, then exit.\n"
+        "  --station-t-acc-ns=N   self-reported timestamp accuracy class in\n"
+        "                         nanoseconds. Defaults to 1000000 (1 ms,\n"
+        "                         NTP-class). Set 1000 for chrony+PPS hosts,\n"
+        "                         100 for GPSDO + 1PPS-locked SDR. Consumed\n"
+        "                         by the fusion-side mlat solver to weight\n"
+        "                         observations from this station.\n"
         "\n"
         "Misc:\n"
         "  --simd-generic         force scalar SIMD (debug)\n"
@@ -286,7 +293,7 @@ int options_parse(int argc, char **argv)
         O_IQ_RECORD, O_STATS_JSON,
         O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_STATION, O_GPSD, O_API_TOKEN,
         O_PCAP, O_PCAP_FIFO, O_PSK_WORDLIST, O_ARCHIVE, O_GEOFENCE, O_ANNOUNCE_TO, O_C2_DEALER,
-        O_ZMQ_CURVE_SECRET, O_ZMQ_CURVE_KEYGEN,
+        O_ZMQ_CURVE_SECRET, O_ZMQ_CURVE_KEYGEN, O_STATION_T_ACC_NS,
         O_DECODE, O_SCAN, O_SCAN_DEC, O_ALERT_OFF_GRID,
         O_SIMD_GEN, O_SELFTEST, O_LIST, O_SCHEMA,
     };
@@ -333,6 +340,7 @@ int options_parse(int argc, char **argv)
         { "c2-dealer", required_argument, NULL, O_C2_DEALER },
         { "zmq-curve-secret", required_argument, NULL, O_ZMQ_CURVE_SECRET },
         { "zmq-curve-keygen", required_argument, NULL, O_ZMQ_CURVE_KEYGEN },
+        { "station-t-acc-ns", required_argument, NULL, O_STATION_T_ACC_NS },
         { "decode",     no_argument,       NULL, O_DECODE },
         { "scan",       no_argument,       NULL, O_SCAN },
         { "scan-and-decode", no_argument,  NULL, O_SCAN_DEC },
@@ -449,6 +457,7 @@ int options_parse(int argc, char **argv)
         case O_C2_DEALER:  opt_c2_dealer = strdup(optarg); break;
         case O_ZMQ_CURVE_SECRET: opt_zmq_curve_secret = strdup(optarg); break;
         case O_ZMQ_CURVE_KEYGEN: opt_zmq_curve_keygen = strdup(optarg); break;
+        case O_STATION_T_ACC_NS: opt_station_t_acc_ns = (uint32_t)strtoul(optarg, NULL, 10); break;
 
         case O_DECODE:           opt_op_mode = OP_MODE_DECODE; break;
         case O_SCAN:             opt_op_mode = OP_MODE_SCAN; break;

@@ -101,6 +101,10 @@ static void jw_field_u32(jw_t *j, const char *name, uint32_t value) {
     jw_field_name(j, name);
     jw_printf(j, "%u", value);
 }
+static void jw_field_u64(jw_t *j, const char *name, uint64_t value) {
+    jw_field_name(j, name);
+    jw_printf(j, "%llu", (unsigned long long)value);
+}
 static void jw_field_i32(jw_t *j, const char *name, int32_t value) {
     jw_field_name(j, name);
     jw_printf(j, "%d", value);
@@ -184,6 +188,13 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
         jw_field_bool(j, "payload_crc_ok", false);
     if (ev->cfo_hz > 100.0f || ev->cfo_hz < -100.0f)
         jw_field_f32(j, "cfo_hz", ev->cfo_hz);
+    /* Multilateration timestamp + accuracy class. Only emit when we
+     * have a station name to attribute observations to (mlat is a
+     * multi-station correlation; an unnamed sensor can't participate). */
+    if (ev->station_t_ns && opt_station_id) {
+        jw_field_u64(j, "station_t_ns",     ev->station_t_ns);
+        jw_field_u32(j, "station_t_acc_ns", ev->station_t_acc_ns);
+    }
 
     /* Radio-layer fields: which physical preset/SF/CR/BW the frame arrived on.
      * Useful for operators bucketing traffic across multiple parallel demods. */

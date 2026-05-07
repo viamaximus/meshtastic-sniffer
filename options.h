@@ -135,6 +135,7 @@ extern char *opt_announce_to;            /* fusion /api/sensors URL; NULL = disa
 extern char *opt_c2_dealer;              /* tcp://fusion:7009; NULL = HTTP-only */
 extern char *opt_zmq_curve_secret;       /* path to Z85 secret key file; sets server CURVE on PUB */
 extern char *opt_zmq_curve_keygen;       /* generate keypair to PATH (.pub written alongside) and exit */
+extern uint32_t opt_station_t_acc_ns;    /* self-reported clock-discipline class in ns; default 1e6 (NTP) */
 
 int  options_parse(int argc, char **argv);
 void options_print_help(const char *prog);

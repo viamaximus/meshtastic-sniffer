@@ -244,12 +244,14 @@ static void replay_check(const mesh_event_t *ev)
 /* Per-emit context handed to mesh_packet_decode_with_radio so the
  * post-decode callback can stamp slot id + RF-quality telemetry the
  * decode function itself doesn't know about (PFB slot index, CRC
- * validity, CFO from the LoRa demod meta). */
+ * validity, CFO, capture timestamp + accuracy class). */
 typedef struct {
-    int   channel_id;
-    bool  has_crc;
-    bool  payload_crc_ok;
-    float cfo_hz;
+    int      channel_id;
+    bool     has_crc;
+    bool     payload_crc_ok;
+    float    cfo_hz;
+    uint64_t station_t_ns;     /* first-replica realtime ns */
+    uint32_t station_t_acc_ns; /* operator-self-reported clock-discipline class */
 } frame_emit_ctx_t;
 
 static void on_mesh_event(const mesh_event_t *ev, void *user) {
@@ -266,9 +268,21 @@ static void on_mesh_event(const mesh_event_t *ev, void *user) {
     stamped.slot_id = (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS)
                       ? channel_id : -1;
     if (ctx) {
-        stamped.has_crc        = ctx->has_crc;
-        stamped.payload_crc_ok = ctx->payload_crc_ok;
-        stamped.cfo_hz         = ctx->cfo_hz;
+        stamped.has_crc          = ctx->has_crc;
+        stamped.payload_crc_ok   = ctx->payload_crc_ok;
+        stamped.cfo_hz           = ctx->cfo_hz;
+        stamped.station_t_ns     = ctx->station_t_ns;
+        stamped.station_t_acc_ns = ctx->station_t_acc_ns;
+        /* CRC-failed frames have corrupt bytes by definition. AES-CTR is
+         * a stream cipher with no integrity check, so the protobuf
+         * parser can "succeed" on garbage and produce fictitious
+         * decoded fields (e.g. POSITION_APP with bogus lat/lon, or
+         * TEXT_MESSAGE_APP with half-corrupt text). Force decrypted=
+         * false here so feed.c suppresses the decoded-port block and
+         * the operator only sees fields earned by intact bytes. */
+        if (stamped.has_crc && !stamped.payload_crc_ok) {
+            stamped.decrypted = false;
+        }
     }
     replay_check(&stamped);
     feed_publish_event(&stamped);
@@ -329,6 +343,7 @@ typedef struct {
     int                 sf;
     int                 bw_hz;
     uint64_t            emit_at_us;     /* now_us + window when first opened */
+    uint64_t            first_seen_t_ns;/* CLOCK_REALTIME ns at first-replica arrival */
     /* Highest-SNR replica seen so far for this cluster. */
     float               best_snr_db;
     size_t              best_payload_len;
@@ -346,6 +361,17 @@ static uint64_t monotonic_us(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+/* CLOCK_REALTIME nanoseconds since the Unix epoch -- the value the mlat
+ * solver consumes as `station_t_ns`. Accuracy is whatever your host
+ * clock is disciplined to (NTP / chrony+PPS / GPSDO); reported by the
+ * sniffer via `station_t_acc_ns` so the solver can weight observations. */
+static uint64_t realtime_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
 /* Buffer the replica into its cluster (matched by fingerprint), keeping
@@ -391,6 +417,11 @@ static void dedup_buffer(const uint8_t *payload, size_t payload_len,
         e->sf               = sf;
         e->bw_hz            = bw;
         e->emit_at_us       = now_us + DEDUP_WINDOW_US;
+        /* Realtime snapshot of FIRST replica arrival -- the closest we
+         * can come to the actual on-air RX moment, modulo demod latency.
+         * Subsequent higher-SNR replicas of the same cluster don't
+         * update this; mlat wants a stable per-frame timestamp. */
+        e->first_seen_t_ns  = realtime_ns();
         e->best_snr_db      = snr;
         e->best_payload_len = payload_len;
         memcpy(e->best_payload, payload, payload_len);
@@ -433,10 +464,12 @@ static void dedup_emit_locked(const dedup_entry_t *e)
                              (uint32_t)ts.tv_sec, (uint32_t)(ts.tv_nsec / 1000));
     }
     frame_emit_ctx_t ctx = {
-        .channel_id     = (int)channel_id,
-        .has_crc        = e->best_meta.has_crc,
-        .payload_crc_ok = e->best_meta.payload_crc_ok,
-        .cfo_hz         = e->best_meta.cfo_hz,
+        .channel_id       = (int)channel_id,
+        .has_crc          = e->best_meta.has_crc,
+        .payload_crc_ok   = e->best_meta.payload_crc_ok,
+        .cfo_hz           = e->best_meta.cfo_hz,
+        .station_t_ns     = e->first_seen_t_ns,
+        .station_t_acc_ns = (uint32_t)opt_station_t_acc_ns,
     };
     mesh_packet_decode_with_radio(e->best_payload, e->best_payload_len,
                                   e->best_meta.rssi_db, e->best_meta.snr_db,
@@ -604,7 +637,6 @@ static void *stats_thread(void *arg)
                 fprintf(stderr, "[stats] WARN dedup drainer silent for %.0f ms -- frames may be backing up\n",
                         (double)(now_us - last_tick) / 1000.0);
             }
-            uint64_t strag = atomic_load_explicit(&g_dedup_stragglers, memory_order_relaxed);
             /* Off-grid count only meaningful when the scanner is wired up.
              * In plain --decode the number is permanently 0; suppress it
              * everywhere it's surfaced rather than print a misleading zero. */
@@ -620,22 +652,20 @@ static void *stats_thread(void *arg)
             /* Mirror the same numbers to the web SSE stream so the
              * dashboard's persistent header can show them live. */
             if (opt_web_port > 0) {
-                char sline[320];
+                char sline[256];
                 int sn;
                 if (scanner_on)
                     sn = snprintf(sline, sizeof(sline),
                         "{\"event\":\"STATS\",\"msps\":%.2f,\"frames\":%llu,"
-                        "\"decrypted\":%llu,\"off_grid\":%llu,\"stragglers\":%llu}\n",
+                        "\"decrypted\":%llu,\"off_grid\":%llu}\n",
                         rate_msps, (unsigned long long)f,
-                        (unsigned long long)d, (unsigned long long)og,
-                        (unsigned long long)strag);
+                        (unsigned long long)d, (unsigned long long)og);
                 else
                     sn = snprintf(sline, sizeof(sline),
                         "{\"event\":\"STATS\",\"msps\":%.2f,\"frames\":%llu,"
-                        "\"decrypted\":%llu,\"stragglers\":%llu}\n",
+                        "\"decrypted\":%llu}\n",
                         rate_msps, (unsigned long long)f,
-                        (unsigned long long)d,
-                        (unsigned long long)strag);
+                        (unsigned long long)d);
                 if (sn > 0) web_publish_line(sline, (size_t)sn);
             }
 
