@@ -295,6 +295,37 @@ function noteNode(p){
   }
 }
 
+// Multilateration: emitter positions estimated by the fusion mlat
+// solver from >=3 timed observations across stations. Each emitter
+// gets a magenta diamond marker plus a confidence circle whose radius
+// equals the solver's reported uncertainty in meters. Updated in
+// place each time a fresh GEOLOCATED event lands for the same node.
+const geolocated = {}; // from -> { marker, circle, lastUpdate }
+function noteGeolocated(p){
+  const id = p.from;
+  let g = geolocated[id];
+  if (!g) {
+    const marker = L.circleMarker([p.lat, p.lon], {
+      radius: 6, color: '#e879f9', weight: 2, fillColor: '#a21caf', fillOpacity: 0.85,
+    }).addTo(map).bindPopup(()=>{
+      const u = p.uncertainty_m !== undefined ? p.uncertainty_m.toFixed(0)+' m' : '?';
+      return '<b>mlat estimate</b><br>'+p.from+'<br>uncertainty: '+u+
+             '<br>stations: '+(p.station_count||'?');
+    });
+    const circle = L.circle([p.lat, p.lon], {
+      radius: Math.max(50, p.uncertainty_m || 100),
+      color: '#a21caf', weight: 1, fillColor: '#a21caf', fillOpacity: 0.08,
+    }).addTo(map);
+    g = geolocated[id] = { marker, circle };
+  } else {
+    g.marker.setLatLng([p.lat, p.lon]);
+    g.circle.setLatLng([p.lat, p.lon]);
+    g.circle.setRadius(Math.max(50, p.uncertainty_m || 100));
+  }
+  g.lastUpdate = Date.now()/1000;
+  if (!mapAutoCentered) { map.setView([p.lat, p.lon], 13); mapAutoCentered = true; }
+}
+
 let liveRafQueued = false;
 function refreshLive(){
   if (liveRafQueued) return;
@@ -618,6 +649,10 @@ es.onmessage=(e)=>{
   nEvents++; setStat('st-events',nEvents);
   if(p.event==='TX'){
     nTx++; setStat('st-tx',nTx);
+    return;
+  }
+  if(p.event==='GEOLOCATED' && p.from && p.lat !== undefined && p.lon !== undefined){
+    noteGeolocated(p);
     return;
   }
   // STATS heartbeat from a sniffer: 5 s cadence per sensor with msps +
