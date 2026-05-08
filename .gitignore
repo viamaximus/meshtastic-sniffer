@@ -29,3 +29,6 @@ __pycache__/
 
 # Internal planning notes -- not for the public repo.
 ROADMAP.md
+
+# Go build artifacts (the source goes in fusion/, the binary doesn't).
+fusion/meshtastic-fusion
