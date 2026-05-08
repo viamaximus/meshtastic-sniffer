@@ -116,6 +116,8 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		}
 	})
+	// Command fan-out endpoints: /api/fanout/keys, share-url, etc.
+	installFanoutHandlers(mux, registry)
 	mux.HandleFunc("/api/sensors/", func(w http.ResponseWriter, r *http.Request) {
 		// Path: /api/sensors/<name> (DELETE only).
 		if r.Method != http.MethodDelete {
