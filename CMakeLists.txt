@@ -115,6 +115,7 @@ set(SOURCES
     ${PROJECT_SOURCE_DIR}/feed.c
     ${PROJECT_SOURCE_DIR}/gpsd.c
     ${PROJECT_SOURCE_DIR}/c2.c
+    ${PROJECT_SOURCE_DIR}/pcap_out.c
     ${PROJECT_SOURCE_DIR}/schema.c
     ${PROJECT_SOURCE_DIR}/scanner.c
     ${PROJECT_SOURCE_DIR}/web.c

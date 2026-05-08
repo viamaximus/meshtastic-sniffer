@@ -126,6 +126,8 @@ extern int   opt_web_port;
 extern char *opt_station_id;
 extern char *opt_gpsd_endpoint;          /* "host:port"; NULL = disabled */
 extern char *opt_api_token;              /* bearer token for POST /api endpoints; NULL = unauthenticated */
+extern char *opt_pcap_path;              /* path to pcap file; NULL = disabled */
+extern char *opt_pcap_fifo;              /* path to pcap fifo; NULL = disabled */
 
 int  options_parse(int argc, char **argv);
 void options_print_help(const char *prog);

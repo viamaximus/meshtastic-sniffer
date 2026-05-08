@@ -16,6 +16,7 @@
 #include "channelizer.h"
 #include "feed.h"
 #include "gpsd.h"
+#include "pcap_out.h"
 #include "schema.h"
 #include "fftw_lock.h"
 #include "file_src.h"
@@ -392,6 +393,16 @@ static void dedup_emit_locked(const dedup_entry_t *e)
                            e->best_payload_len, __ATOMIC_RELAXED);
         g_chan_stats[channel_id].snr_db_sum   += (double)e->best_meta.snr_db;
         g_chan_stats[channel_id].snr_db_count += 1;
+    }
+    /* PCAP output: write the wire-shape frame (16-byte radio header +
+     * still-encrypted payload) before any decrypt attempt, with the
+     * current wall-clock timestamp. After dedup so we get one frame
+     * per real transmission, not one per bin-leakage replica. */
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        pcap_out_write_frame(e->best_payload, e->best_payload_len,
+                             (uint32_t)ts.tv_sec, (uint32_t)(ts.tv_nsec / 1000));
     }
     mesh_packet_decode_with_radio(e->best_payload, e->best_payload_len,
                                   e->best_meta.rssi_db, e->best_meta.snr_db,
@@ -1235,6 +1246,8 @@ static int run_live(void)
     }
 
     feed_init();
+    if (opt_pcap_path) pcap_out_init(opt_pcap_path, false);
+    else if (opt_pcap_fifo) pcap_out_init(opt_pcap_fifo, true);
     if (opt_gpsd_endpoint) {
         if (gpsd_init(opt_gpsd_endpoint))
             fprintf(stderr, "gpsd: tagging events with station_lat/_lon/_alt_m from %s\n",
@@ -1291,6 +1304,7 @@ static int run_live(void)
     web_shutdown();
     feed_shutdown();
     gpsd_shutdown();
+    pcap_out_shutdown();
     for (int i = 0; i < CHANNELIZER_MAX_CHANNELS; ++i) {
         if (g_demods[i]) { lora_decoder_destroy(g_demods[i]); g_demods[i] = NULL; }
     }

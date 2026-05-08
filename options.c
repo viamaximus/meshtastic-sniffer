@@ -97,6 +97,8 @@ int   opt_web_port                = 0;
 char *opt_station_id              = NULL;
 char *opt_gpsd_endpoint           = NULL;
 char *opt_api_token               = NULL;
+char *opt_pcap_path               = NULL;
+char *opt_pcap_fifo               = NULL;
 
 void options_print_help(const char *prog)
 {
@@ -184,6 +186,10 @@ void options_print_help(const char *prog)
         "  --api-token=SECRET     require 'Authorization: Bearer SECRET' on every\n"
         "                         POST /api/* request. GET endpoints (dashboard,\n"
         "                         /events SSE) stay open. Unset = no auth.\n"
+        "  --pcap=PATH            write received LoRa frames to PATH as a libpcap\n"
+        "                         file (DLT_USER0=147). Use with tshark / Wireshark.\n"
+        "  --pcap-fifo=PATH       like --pcap but creates PATH as a named pipe;\n"
+        "                         start `wireshark -k -i PATH` for live capture.\n"
         "\n"
         "Misc:\n"
         "  --simd-generic         force scalar SIMD (debug)\n"
@@ -244,6 +250,7 @@ int options_parse(int argc, char **argv)
         O_REGION, O_PRESETS, O_KEYS, O_KEYS_FILE, O_SHARE_URL, O_EXTRA_FREQ,
         O_IQ_RECORD, O_STATS_JSON,
         O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_STATION, O_GPSD, O_API_TOKEN,
+        O_PCAP, O_PCAP_FIFO,
         O_DECODE, O_SCAN, O_SCAN_DEC, O_ALERT_OFF_GRID,
         O_SIMD_GEN, O_SELFTEST, O_LIST, O_SCHEMA,
     };
@@ -281,6 +288,8 @@ int options_parse(int argc, char **argv)
         { "station-id", required_argument, NULL, O_STATION },
         { "gpsd",       optional_argument, NULL, O_GPSD },
         { "api-token",  required_argument, NULL, O_API_TOKEN },
+        { "pcap",       required_argument, NULL, O_PCAP },
+        { "pcap-fifo",  required_argument, NULL, O_PCAP_FIFO },
         { "decode",     no_argument,       NULL, O_DECODE },
         { "scan",       no_argument,       NULL, O_SCAN },
         { "scan-and-decode", no_argument,  NULL, O_SCAN_DEC },
@@ -388,6 +397,8 @@ int options_parse(int argc, char **argv)
         case O_STATION:    opt_station_id = strdup(optarg); break;
         case O_GPSD:       opt_gpsd_endpoint = strdup(optarg ? optarg : "localhost:2947"); break;
         case O_API_TOKEN:  opt_api_token = strdup(optarg); break;
+        case O_PCAP:       opt_pcap_path = strdup(optarg); break;
+        case O_PCAP_FIFO:  opt_pcap_fifo = strdup(optarg); break;
 
         case O_DECODE:           opt_op_mode = OP_MODE_DECODE; break;
         case O_SCAN:             opt_op_mode = OP_MODE_SCAN; break;
