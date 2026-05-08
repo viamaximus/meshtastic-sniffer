@@ -77,8 +77,10 @@ func clusterKey(from string, pid uint32) string {
 }
 
 // subscribe connects a SUB socket to each endpoint and writes received
-// raw JSON bytes onto out. The context cancels the goroutines on shutdown.
-func subscribe(ctx context.Context, endpoints []string, out chan<- []byte) {
+// raw JSON bytes onto out. Each received message is also broadcast to
+// `hub` if non-nil so SSE clients see the firehose. The context cancels
+// the goroutines on shutdown.
+func subscribe(ctx context.Context, endpoints []string, out chan<- []byte, hub *SSEHub) {
 	var wg sync.WaitGroup
 	for _, ep := range endpoints {
 		wg.Add(1)
@@ -103,6 +105,9 @@ func subscribe(ctx context.Context, endpoints []string, out chan<- []byte) {
 				}
 				if len(msg.Frames) == 0 {
 					continue
+				}
+				if hub != nil {
+					hub.Publish(msg.Frames[0])
 				}
 				select {
 				case out <- msg.Frames[0]:
@@ -157,11 +162,47 @@ func printCluster(c *Cluster, totalStations int) {
 		len(stations), totalStations, strings.Join(parts, ", "))
 }
 
+// txEventJSON returns the consolidated cluster as a JSON line for SSE
+// publication. Distinct event type ('TX') so dashboard JS can keyhole
+// it from the raw per-frame events that flow alongside.
+func txEventJSON(c *Cluster, totalStations int) ([]byte, error) {
+	type stationObs struct {
+		Name   string  `json:"name"`
+		SnrDB  float64 `json:"snr_db,omitempty"`
+		Lat    float64 `json:"lat,omitempty"`
+		Lon    float64 `json:"lon,omitempty"`
+	}
+	out := struct {
+		Event       string       `json:"event"`
+		From        string       `json:"from"`
+		PacketID    uint32       `json:"packet_id"`
+		ChannelName string       `json:"channel_name,omitempty"`
+		Preset      string       `json:"preset,omitempty"`
+		HopLimit    int          `json:"hop_limit"`
+		HopStart    int          `json:"hop_start"`
+		Stations    []stationObs `json:"stations"`
+		TotalSensors int         `json:"total_sensors"`
+	}{
+		Event: "TX", From: c.Frame.From, PacketID: c.Frame.PacketID,
+		ChannelName: c.Frame.ChannelName, Preset: c.Frame.Preset,
+		HopLimit: c.Frame.HopLimit, HopStart: c.Frame.HopStart,
+		TotalSensors: totalStations,
+	}
+	for _, o := range c.Observations {
+		out.Stations = append(out.Stations, stationObs{
+			Name: o.Station, SnrDB: o.SnrDB, Lat: o.StationLat, Lon: o.StationLon,
+		})
+	}
+	return json.Marshal(out)
+}
+
 func main() {
 	window := flag.Duration("window", 5*time.Second,
 		"Dedup window across stations (e.g. 3s, 250ms)")
 	maxFrames := flag.Int("max-frames", 0,
 		"Stop after N consolidated frames (0 = unlimited)")
+	listen := flag.String("listen", "",
+		"HTTP listen address (e.g. :9000). Empty = CLI-only mode.")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr,
 			"Usage: %s [flags] tcp://host1:7008 tcp://host2:7008 ...\n\n"+
@@ -187,8 +228,19 @@ func main() {
 		cancel()
 	}()
 
+	var hub *SSEHub
+	if *listen != "" {
+		hub = newSSEHub()
+		go func() {
+			if err := startWebServer(ctx, *listen, hub); err != nil {
+				log.Printf("web: %v", err)
+				cancel()
+			}
+		}()
+	}
+
 	raw := make(chan []byte, 256)
-	go subscribe(ctx, endpoints, raw)
+	go subscribe(ctx, endpoints, raw, hub)
 
 	pending := map[string]*Cluster{}
 	consolidated := 0
@@ -233,6 +285,11 @@ loop:
 			ready := flushReady(pending, *window, now)
 			for _, c := range ready {
 				printCluster(c, len(endpoints))
+				if hub != nil {
+					if b, err := txEventJSON(c, len(endpoints)); err == nil {
+						hub.Publish(b)
+					}
+				}
 				consolidated++
 				if *maxFrames > 0 && consolidated >= *maxFrames {
 					cancel()
