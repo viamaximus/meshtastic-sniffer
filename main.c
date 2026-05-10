@@ -577,6 +577,9 @@ static void on_lora_frame(const uint8_t *payload, size_t payload_len,
 /* Forward decl for the web SSE publisher (we don't include web.h here
  * to avoid a circular dep when only main needs to push raw lines). */
 extern void web_publish_line(const char *json, size_t len);
+/* Forward decl for the ZMQ PUB publisher; lets STATS heartbeats reach
+ * meshtastic-fusion as part of the regular event stream. */
+extern void zmq_pub_publish(const char *json, size_t len);
 
 /* Friendly watchdog: warn loudly if samples don't flow in 2s and if no
  * LoRa frames decode in 30s. Fires each warning at most once. */
@@ -665,24 +668,32 @@ static void *stats_thread(void *arg)
                 fprintf(stderr, "[stats] %.2f Msps in, %llu LoRa frames, %llu decrypted\n",
                         rate_msps, (unsigned long long)f, (unsigned long long)d);
 
-            /* Mirror the same numbers to the web SSE stream so the
-             * dashboard's persistent header can show them live. */
-            if (opt_web_port > 0) {
-                char sline[256];
-                int sn;
-                if (scanner_on)
-                    sn = snprintf(sline, sizeof(sline),
-                        "{\"event\":\"STATS\",\"msps\":%.2f,\"frames\":%llu,"
-                        "\"decrypted\":%llu,\"off_grid\":%llu}\n",
-                        rate_msps, (unsigned long long)f,
-                        (unsigned long long)d, (unsigned long long)og);
-                else
-                    sn = snprintf(sline, sizeof(sline),
-                        "{\"event\":\"STATS\",\"msps\":%.2f,\"frames\":%llu,"
-                        "\"decrypted\":%llu}\n",
-                        rate_msps, (unsigned long long)f,
-                        (unsigned long long)d);
-                if (sn > 0) web_publish_line(sline, (size_t)sn);
+            /* STATS heartbeat fan-out: web SSE for the local dashboard,
+             * ZMQ PUB so meshtastic-fusion can populate per-sensor
+             * msps / decrypt% in its Sensors tab. The "station" field
+             * tags the source sniffer when --station-id is set;
+             * fusion's subscriber loop falls back to the registry name
+             * if absent. */
+            char sline[320];
+            int sn;
+            const char *sid = opt_station_id ? opt_station_id : "";
+            if (scanner_on)
+                sn = snprintf(sline, sizeof(sline),
+                    "{\"event\":\"STATS\",\"station\":\"%s\","
+                    "\"msps\":%.2f,\"frames\":%llu,"
+                    "\"decrypted\":%llu,\"off_grid\":%llu}\n",
+                    sid, rate_msps, (unsigned long long)f,
+                    (unsigned long long)d, (unsigned long long)og);
+            else
+                sn = snprintf(sline, sizeof(sline),
+                    "{\"event\":\"STATS\",\"station\":\"%s\","
+                    "\"msps\":%.2f,\"frames\":%llu,"
+                    "\"decrypted\":%llu}\n",
+                    sid, rate_msps, (unsigned long long)f,
+                    (unsigned long long)d);
+            if (sn > 0) {
+                if (opt_web_port > 0) web_publish_line(sline, (size_t)sn);
+                zmq_pub_publish(sline, (size_t)sn);
             }
 
             if (opt_stats_json) {
